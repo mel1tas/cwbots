@@ -260,9 +260,34 @@ def setup_database():
 MAX_SQL_INT = 9_223_372_036_854_775_807
 MIN_SQL_INT = -9_223_372_036_854_775_808
 
+
 def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQL_INT) -> int:
+    """Преобразует значение в int, поддерживая суффиксы вида "7к", "7кк", "7млн", "7млрд".
+
+    Также проверяет выход за пределы допустимого диапазона SQLite.
+    """
+
     try:
-        iv = int(v)
+        if isinstance(v, str):
+            s = v.strip().lower().replace(" ", "")
+            multiplier = 1
+            if s.endswith("млрд"):
+                multiplier = 1_000_000_000
+                s = s[:-4]
+            elif s.endswith("млн"):
+                multiplier = 1_000_000
+                s = s[:-3]
+            elif s.endswith("кк"):
+                multiplier = 1_000_000
+                s = s[:-2]
+            elif s.endswith("к"):
+                multiplier = 1_000
+                s = s[:-1]
+            if s in ("", "+", "-"):
+                raise ValueError
+            iv = int(s) * multiplier
+        else:
+            iv = int(v)
     except Exception:
         raise ValueError(f"{name}: не число.")
     if iv < min_v or iv > max_v:
@@ -896,9 +921,10 @@ class CountryNumberModal(disnake.ui.Modal):
         self.field_key = field_key
     async def callback(self, inter: disnake.ModalInteraction):
         raw = inter.text_values["num"].strip()
-        if not raw.isdigit() or int(raw) <= 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Введите положительное целое число."), ephemeral=True)
-        num = int(raw)
+        try:
+            num = safe_int(raw, name="Число", min_v=1)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         if self.field_key == "territory":
             self.view_ref.draft.territory_km2 = num
         elif self.field_key == "population":
@@ -2619,8 +2645,10 @@ class BasicInfoModal(disnake.ui.Modal):
         if sell_raw == "skip":
             disallow_sell = 1
         else:
-            if not sell_raw.isdigit() or int(sell_raw) < 0:
-                return await inter.response.send_message(embed=error_embed("Ошибка", "Цена продажи должна быть неотрицательным числом или 'skip'."), ephemeral=True)
+            try:
+                safe_int(sell_raw, name="Цена продажи", min_v=0)
+            except ValueError as e:
+                return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
 
         self.view_ref.draft.name = name
         self.view_ref.draft.description = desc
@@ -2647,13 +2675,15 @@ class CurrencyPriceModal(disnake.ui.Modal):
 
     async def callback(self, inter: disnake.ModalInteraction):
         raw = inter.text_values.get("price", "").strip()
-        if not raw.isdigit() or int(raw) <= 0:
+        try:
+            price_val = safe_int(raw, name="Цена", min_v=1)
+        except ValueError as e:
             return await inter.response.send_message(
-                embed=error_embed("Ошибка", "Цена должна быть положительным числом."),
+                embed=error_embed("Ошибка", str(e)),
                 ephemeral=True
             )
         self.view_ref.draft.buy_price_type = "currency"
-        self.view_ref.draft.price_currency = int(raw)
+        self.view_ref.draft.price_currency = price_val
         # Вместо .clear() (падает, если cost_items = None/строка) — просто переустанавливаем
         self.view_ref.draft.cost_items = []
         await inter.response.edit_message(embed=self.view_ref.build_embed(), view=self.view_ref)
@@ -2684,8 +2714,10 @@ class AddCostItemByNameModal(disnake.ui.Modal):
         iname = inter.text_values.get("iname", "").strip()
         qty_raw = inter.text_values.get("qty", "").strip()
 
-        if not qty_raw.isdigit() or int(qty_raw) <= 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Количество должно быть положительным числом."), ephemeral=True)
+        try:
+            qty_val = safe_int(qty_raw, name="Количество", min_v=1)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
 
         await inter.response.send_message("Открыл выбор предмета в чате. Следуйте инструкции и введите номер в ответ.", ephemeral=True)
 
@@ -2695,7 +2727,7 @@ class AddCostItemByNameModal(disnake.ui.Modal):
                 with contextlib.suppress(Exception):
                     await self.view_ref.ctx.send(embed=error_embed("Выбор предмета", err or "Не удалось определить предмет."))
                 return
-            qty = int(qty_raw)
+            qty = qty_val
 
             # Проверяем, не является ли добавляемый предмет тем же, что мы редактируем
             if self.view_ref.draft.editing_item_id and item["id"] == self.view_ref.draft.editing_item_id:
@@ -2778,19 +2810,26 @@ class ShopSettingsModal(disnake.ui.Modal):
             return await inter.response.send_message(embed=error_embed("Ошибка", "Поле «Продается?» должно быть 'да' или 'нет'."), ephemeral=True)
         is_listed = 1 if listed_raw == "да" else 0
 
-        if stock_raw != "skip" and (not stock_raw.isdigit() or int(stock_raw) <= 0):
-            return await inter.response.send_message(embed=error_embed("Ошибка", "«Общее количество» должно быть положительным числом или 'skip'."), ephemeral=True)
+        if stock_raw != "skip":
+            try:
+                safe_int(stock_raw, name="Общее количество", min_v=1)
+            except ValueError as e:
+                return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
 
-        if not restock_raw.isdigit() or int(restock_raw) < 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "«Автопополнение» должно быть неотрицательным числом."), ephemeral=True)
+        try:
+            restock_val = safe_int(restock_raw, name="Автопополнение", min_v=0)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
 
-        if not limit_raw.isdigit() or int(limit_raw) < 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "«Лимит в день» должен быть неотрицательным числом."), ephemeral=True)
+        try:
+            limit_val = safe_int(limit_raw, name="Лимит в день", min_v=0)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
 
         self.view_ref.draft.is_listed = is_listed
         self.view_ref.draft.stock_total_raw = stock_raw
-        self.view_ref.draft.restock_per_day = int(restock_raw)
-        self.view_ref.draft.per_user_daily_limit = int(limit_raw)
+        self.view_ref.draft.restock_per_day = restock_val
+        self.view_ref.draft.per_user_daily_limit = limit_val
 
         await inter.response.edit_message(embed=self.view_ref.build_embed(), view=self.view_ref)
 
@@ -3163,13 +3202,8 @@ class CreateItemWizard(disnake.ui.View):
         def safe_int(v, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQL_INT) -> int:
             if v is None:
                 raise ValueError(f"{name}: не задано.")
-            try:
-                iv = int(v)
-            except Exception:
-                raise ValueError(f"{name}: должно быть числом.")
-            if iv < min_v or iv > max_v:
-                raise ValueError(f"{name}: выходит за допустимые пределы [{min_v}; {max_v}].")
-            return iv
+            # используем глобальную функцию safe_int, поддерживающую суффиксы
+            return globals()["safe_int"](v, name=name, min_v=min_v, max_v=max_v)
 
         def safe_optional_int(v, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQL_INT):
             if v is None:
@@ -3625,19 +3659,29 @@ async def create_item_cmd(ctx: commands.Context):
 def _parse_amount_and_name(raw: str) -> tuple[int, str] | tuple[None, None]:
     """
     Парсит строку вида:
-      - "3 Меч" -> (3, "Меч")
-      - "Меч"   -> (1, "Меч")
+      - "3 Меч" или "Меч 3" -> (3, "Меч")
+      - "Меч"                -> (1, "Меч")
+
+    Поддерживает числовые суффиксы ("15к", "2млн" и т.д.).
     """
     s = (raw or "").strip()
     if not s:
         return None, None
-    parts = s.split(maxsplit=1)
-    if parts[0].isdigit():
-        amt = int(parts[0])
-        name = parts[1].strip() if len(parts) > 1 else ""
-        return amt, name
-    else:
-        return 1, s
+    parts = s.split()
+    if not parts:
+        return None, None
+
+    if any(ch.isdigit() for ch in parts[0]):
+        amt = safe_int(parts[0], name="Количество", min_v=1)
+        name = " ".join(parts[1:]).strip()
+        return (amt, name) if name else (None, None)
+
+    if len(parts) > 1 and any(ch.isdigit() for ch in parts[-1]):
+        amt = safe_int(parts[-1], name="Количество", min_v=1)
+        name = " ".join(parts[:-1]).strip()
+        return (amt, name) if name else (None, None)
+
+    return 1, s
 
 
 # ДОБАВИТЬ ЭТОТ КОД
@@ -3839,7 +3883,10 @@ async def buy_cmd(ctx: commands.Context, *, raw: str):
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
 
-    amount, name = _parse_amount_and_name(raw)
+    try:
+        amount, name = _parse_amount_and_name(raw)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Неверное количество", str(e)))
     if amount is None or not name:
         return await ctx.send(embed=usage_embed("buy"))
     if amount <= 0:
@@ -3969,7 +4016,10 @@ async def sell_cmd(ctx: commands.Context, *, raw: str):
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    amount, name = _parse_amount_and_name(raw)
+    try:
+        amount, name = _parse_amount_and_name(raw)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Неверное количество", str(e)))
     if amount is None or not name:
         return await ctx.send(embed=usage_embed("sell"))
     if amount <= 0:
@@ -4507,25 +4557,17 @@ def _parse_export_tail(raw: str) -> tuple[Optional[str], Optional[int], Optional
     parts = [p.strip() for p in raw.split() if p.strip()]
     if len(parts) < 3:
         return None, None, None, "Недостаточно аргументов. Пример: !export @user Железо 10 5000"
-    if not parts[-1].isdigit() or not parts[-2].isdigit():
-        return None, None, None, "Последние два аргумента должны быть числами: <Кол-во> <Цена>."
-    qty = int(parts[-2])
-    price = int(parts[-1])
-
-    # Ограничения на вводимые числа (после int())
+    
     HUMAN_LIMIT_PRICE = 1_000_000_000_000_000  # настройте под свою экономику
     HUMAN_LIMIT_QTY = 1_000_000_000
 
-    if qty > HUMAN_LIMIT_QTY:
-        return None, None, None, f"Количество слишком велико. Максимум: {HUMAN_LIMIT_QTY}."
-    if price > HUMAN_LIMIT_PRICE:
-        return None, None, None, f"Цена слишком велика. Максимум: {HUMAN_LIMIT_PRICE}."
+    try:
+        qty = safe_int(parts[-2], name="Кол-во", min_v=1, max_v=HUMAN_LIMIT_QTY)
+        price = safe_int(parts[-1], name="Цена", min_v=1, max_v=HUMAN_LIMIT_PRICE)
+    except ValueError as e:
+        return None, None, None, str(e)
 
     name = " ".join(parts[:-2]).strip()
-    if qty <= 0:
-        return None, None, None, "Количество должно быть положительным."
-    if price <= 0:
-        return None, None, None, "Цена должна быть положительным числом."
     if not name:
         return None, None, None, "Название предмета не распознано."
     return name, qty, price, None
@@ -4727,19 +4769,20 @@ async def inv_cmd(ctx: commands.Context, arg: Optional[str] = None, page: int = 
 def _parse_name_then_optional_amount(raw: str) -> tuple[Optional[str], Optional[int]]:
     """
     Парсит строку: '<название|ID> [кол-во]'.
-    Если последний токен — число, это количество, иначе количество=1.
+    Если последний токен — число (поддерживаются суффиксы), это количество,
+    иначе количество=1.
     """
     s = (raw or "").strip()
     if not s:
         return None, None
-    name = s
-    amount = 1
-    if " " in s:
-        left, right = s.rsplit(" ", 1)
-        if right.isdigit():
-            name = left.strip()
-            amount = int(right)
-    return (name if name else None), amount
+    parts = s.split()
+    if not parts:
+        return None, None
+    if len(parts) > 1 and any(ch.isdigit() for ch in parts[-1]):
+        amt = safe_int(parts[-1], name="Количество", min_v=1)
+        name = " ".join(parts[:-1]).strip()
+        return (name if name else None), amt
+    return s, 1
 
 
 @bot.command(name="reset-inventory", aliases=["reset-inv", "inv-reset"])
@@ -4832,7 +4875,10 @@ async def use_cmd(ctx: commands.Context, *, raw: str):
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
 
-    name, amount = _parse_name_then_optional_amount(raw)
+    try:
+        name, amount = _parse_name_then_optional_amount(raw)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Неверное количество", str(e)))
     if not name:
         return await ctx.send(embed=usage_embed("use"))
     if amount <= 0:
@@ -4888,7 +4934,10 @@ async def give_item_cmd(ctx: commands.Context, member: disnake.Member, *, raw: s
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
 
-    name, amount = _parse_name_then_optional_amount(raw)
+    try:
+        name, amount = _parse_name_then_optional_amount(raw)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Неверное количество", str(e)))
     if not name:
         return await ctx.send(embed=usage_embed("give-item"))
     if amount <= 0:
@@ -4922,7 +4971,10 @@ async def take_item_cmd(ctx: commands.Context, member: disnake.Member, *, raw: s
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
 
-    name, amount = _parse_name_then_optional_amount(raw)
+    try:
+        name, amount = _parse_name_then_optional_amount(raw)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Неверное количество", str(e)))
     if not name:
         return await ctx.send(embed=usage_embed("take-item"))
     if amount <= 0:
@@ -5724,8 +5776,10 @@ class RIMoneyModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         money_raw = (inter.text_values.get("ri_money") or "").replace(" ", "")
         cd_raw = (inter.text_values.get("ri_cd") or "").strip()
-        if not money_raw.isdigit() or int(money_raw) <= 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Сумма должна быть положительным целым."), ephemeral=True)
+        try:
+            money_val = safe_int(money_raw, name="Сумма", min_v=1)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         cd = parse_duration_to_seconds(cd_raw)
         if cd is None or cd <= 0:
             return await inter.response.send_message(embed=error_embed("Ошибка", "Введите валидный кулдаун (> 0)."), ephemeral=True)
@@ -5737,7 +5791,7 @@ class RIMoneyModal(disnake.ui.Modal):
             inter.guild.id,
             self.role_id,
             "money",
-            int(money_raw),
+            money_val,
             [],
             cd,
             created_by=(inter.user.id if self.mode == "add" else None)
@@ -5791,14 +5845,15 @@ class RIItemsModal(disnake.ui.Modal):
         valid_ids = {int(it["id"]) for it in all_items}
         for ln in lines:
             parts = ln.replace("×", " ").replace("x", " ").split()
-            if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            if len(parts) < 2 or not parts[0].isdigit():
                 return await inter.response.send_message(embed=error_embed("Ошибка", f"Неверная строка: «{ln}». Используйте «ID количество»."), ephemeral=True)
             iid = int(parts[0])
-            qty = int(parts[1])
+            try:
+                qty = safe_int(parts[1], name="Количество", min_v=1)
+            except ValueError as e:
+                return await inter.response.send_message(embed=error_embed("Ошибка", f"ID {iid}: {e}"), ephemeral=True)
             if iid not in valid_ids:
                 return await inter.response.send_message(embed=error_embed("Ошибка", f"Предмет с ID {iid} не найден в магазине."), ephemeral=True)
-            if qty <= 0:
-                return await inter.response.send_message(embed=error_embed("Ошибка", f"Количество для ID {iid} должно быть > 0."), ephemeral=True)
             items_list.append({"item_id": iid, "qty": qty})
         if not items_list:
             return await inter.response.send_message(embed=error_embed("Ошибка", "Список предметов пуст."), ephemeral=True)
@@ -6243,7 +6298,7 @@ async def balance_prefix(ctx: commands.Context, user: disnake.Member = None):
 
 # ====== НОВАЯ РЕАЛИЗАЦИЯ !pay С УЧЕТОМ КОМИССИИ ВСЕМИРНОГО БАНКА ======
 @bot.command(name="pay", aliases=["Pay", "PAY", "Перевод", "перевод", "ПЕРЕВОД"])
-async def pay_prefix(ctx: commands.Context, recipient: disnake.Member, amount: int):
+async def pay_prefix(ctx: commands.Context, recipient: disnake.Member, amount_raw: str):
     """
     Перевод денег между пользователями с комиссией Всемирного банка.
       !pay @получатель <сумма>
@@ -6256,8 +6311,10 @@ async def pay_prefix(ctx: commands.Context, recipient: disnake.Member, amount: i
     if recipient == ctx.author:
         await ctx.send("Вы не можете переводить деньги самому себе!")
         return
-    if amount is None or amount <= 0:
-        await ctx.send(embed=usage_embed("pay"))
+    try:
+        amount = safe_int(amount_raw, name="Сумма", min_v=1)
+    except ValueError as e:
+        await ctx.send(embed=error_embed("Ошибка", str(e)))
         return
 
     sender_balance = get_balance(ctx.guild.id, ctx.author.id)
@@ -6544,7 +6601,7 @@ async def take_role_cmd(ctx: commands.Context, member: disnake.Member, *, role_q
 # ================= Команды: управление деньгами (пользователь) =================
 
 @bot.command(name="add-money", aliases=["Add-money", "ADD-MONEY"])
-async def add_money_cmd(ctx: commands.Context, member: disnake.Member, amount: int):
+async def add_money_cmd(ctx: commands.Context, member: disnake.Member, amount_raw: str):
     """
     Выдать деньги пользователю:
       !add-money @пользователь <сумма>
@@ -6553,8 +6610,10 @@ async def add_money_cmd(ctx: commands.Context, member: disnake.Member, amount: i
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    if amount is None or amount <= 0:
-        return await ctx.send(embed=usage_embed("add-money"))
+    try:
+        amount = safe_int(amount_raw, name="Сумма", min_v=1)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Ошибка", str(e)))
     update_balance(ctx.guild.id, member.id, amount)
     new_bal = get_balance(ctx.guild.id, member.id)
     embed = build_money_action_embed(
@@ -6566,7 +6625,7 @@ async def add_money_cmd(ctx: commands.Context, member: disnake.Member, amount: i
     await send_money_action_log(ctx.guild, ctx.author, "add", member, amount)
 
 @bot.command(name="remove-money", aliases=["Remove-money", "REMOVE-MONEY", "Remove-Money"])
-async def remove_money_cmd(ctx: commands.Context, member: disnake.Member, amount: int):
+async def remove_money_cmd(ctx: commands.Context, member: disnake.Member, amount_raw: str):
     """
     Списать деньги у пользователя:
       !remove-money @пользователь <сумма>
@@ -6575,8 +6634,10 @@ async def remove_money_cmd(ctx: commands.Context, member: disnake.Member, amount
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    if amount is None or amount <= 0:
-        return await ctx.send(embed=usage_embed("remove-money"))
+    try:
+        amount = safe_int(amount_raw, name="Сумма", min_v=1)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Ошибка", str(e)))
 
     current = get_balance(ctx.guild.id, member.id)
     if amount > current:
@@ -6619,7 +6680,7 @@ async def reset_money_cmd(ctx: commands.Context, member: disnake.Member):
 # ================= Команды: управление деньгами (роль) =================
 
 @bot.command(name="add-money-role")
-async def add_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount: int):
+async def add_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount_raw: str):
     """
     Выдать деньги всем пользователям с ролью:
       !add-money-role @роль <сумма>
@@ -6628,8 +6689,10 @@ async def add_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount: 
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    if amount is None or amount <= 0:
-        return await ctx.send(embed=usage_embed("add-money-role"))
+    try:
+        amount = safe_int(amount_raw, name="Сумма", min_v=1)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Ошибка", str(e)))
 
     members = [m for m in role.members if m.guild.id == ctx.guild.id]
     for m in members:
@@ -6644,7 +6707,7 @@ async def add_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount: 
     await send_money_action_log(ctx.guild, ctx.author, "add", role, amount)
 
 @bot.command(name="remove-money-role")
-async def remove_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount: int):
+async def remove_money_role_cmd(ctx: commands.Context, role: disnake.Role, amount_raw: str):
     """
     Снять деньги у всех пользователей с ролью:
       !remove-money-role @роль <сумма>
@@ -6653,8 +6716,10 @@ async def remove_money_role_cmd(ctx: commands.Context, role: disnake.Role, amoun
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    if amount is None or amount <= 0:
-        return await ctx.send(embed=usage_embed("remove-money-role"))
+    try:
+        amount = safe_int(amount_raw, name="Сумма", min_v=1)
+    except ValueError as e:
+        return await ctx.send(embed=error_embed("Ошибка", str(e)))
 
     members = [m for m in role.members if m.guild.id == ctx.guild.id]
     for m in members:
@@ -6740,11 +6805,10 @@ class WBPercentModal(disnake.ui.Modal):
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
         raw = (inter.text_values.get("wb_percent") or "").strip()
-        if not raw.isdigit():
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Введите целое число от 1 до 10."), ephemeral=True)
-        val = int(raw)
-        if val < 1 or val > 10:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Ставка должна быть от 1 до 10%."), ephemeral=True)
+        try:
+            val = safe_int(raw, name="Процент", min_v=1, max_v=10)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         set_commission_percent(inter.guild.id, val)
         await inter.response.edit_message(embed=build_worldbank_embed(inter.guild, self.view_ref.ctx.author), view=self.view_ref)
         await inter.followup.send(f"Ставка комиссии обновлена: {val}%.", ephemeral=True)
@@ -6770,9 +6834,10 @@ class WBWithdrawModal(disnake.ui.Modal):
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
         raw = (inter.text_values.get("wb_withdraw") or "").replace(" ", "").strip()
-        if not raw.isdigit() or int(raw) <= 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Введите положительное целое число."), ephemeral=True)
-        amount = int(raw)
+        try:
+            amount = safe_int(raw, name="Сумма", min_v=1)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         bank_bal = get_worldbank_balance(inter.guild.id)
         if amount > bank_bal:
             return await inter.response.send_message(embed=error_embed("Недостаточно средств в казне", f"В банке только {format_number(bank_bal)} {MONEY_EMOJI}."), ephemeral=True)
@@ -6805,9 +6870,10 @@ class WBDepositModal(disnake.ui.Modal):
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
         raw = (inter.text_values.get("wb_deposit") or "").replace(" ", "").strip()
-        if not raw.isdigit() or int(raw) <= 0:
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Введите положительное целое число."), ephemeral=True)
-        amount = int(raw)
+        try:
+            amount = safe_int(raw, name="Сумма", min_v=1)
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         user_bal = get_balance(inter.guild.id, inter.user.id)
         if amount > user_bal:
             return await inter.response.send_message(embed=error_embed("Недостаточно средств", f"Ваш баланс: {format_number(user_bal)} {MONEY_EMOJI}"), ephemeral=True)
@@ -7032,11 +7098,10 @@ class _NumModal(disnake.ui.Modal):
 
     async def callback(self, inter: disnake.ModalInteraction):
         raw = (inter.text_values.get(self._cid) or "").strip().replace(" ", "")
-        if not raw.isdigit():
-            return await inter.response.send_message(embed=error_embed("Неверный ввод", "Введите целое неотрицательное число."), ephemeral=True)
-        val = int(raw)
-        if not self._min0 and val <= 0:
-            return await inter.response.send_message(embed=error_embed("Неверный ввод", "Значение должно быть положительным."), ephemeral=True)
+        try:
+            val = safe_int(raw, name="Значение", min_v=(0 if self._min0 else 1))
+        except ValueError as e:
+            return await inter.response.send_message(embed=error_embed("Неверный ввод", str(e)), ephemeral=True)
         ok, msg = self.view_ref.apply_numeric(self._cid, val)
         if not ok:
             return await inter.response.send_message(embed=error_embed("Ошибка", msg or "Проверьте значения."), ephemeral=True)
@@ -7698,13 +7763,15 @@ class CandidateModal(disnake.ui.Modal):
         ideology = inter.text_values.get("ideology", "").strip()
         party = inter.text_values.get("party", "").strip()
 
-        if not age_raw.isdigit() or int(age_raw) <= 0 or int(age_raw) > 120:
+        try:
+            age = safe_int(age_raw, name="Возраст", min_v=1, max_v=120)
+        except ValueError as e:
             return await inter.response.send_message(
-                embed=error_embed("Ошибка", "Возраст должен быть положительным числом (1–120)."),
+                embed=error_embed("Ошибка", str(e)),
                 ephemeral=True
             )
 
-        cand = Candidate(name=name, age=int(age_raw), ideology=ideology, party=party)
+        cand = Candidate(name=name, age=age, ideology=ideology, party=party)
         self.view_ref.candidates.append(cand)
         self.view_ref._sync_buttons_state()
 
@@ -8328,12 +8395,14 @@ class BumpRewardAmountModal(disnake.ui.Modal):
 
     async def callback(self, inter: disnake.ModalInteraction):
         raw = inter.text_values.get("amount", "").strip()
-        if not raw.isdigit() or int(raw) < 0:
+        try:
+            amount = safe_int(raw, name="Сумма", min_v=0)
+        except ValueError as e:
             return await inter.response.send_message(
-                embed=error_embed("Ошибка", "Введите неотрицательное целое число."),
+                embed=error_embed("Ошибка", str(e)),
                 ephemeral=True
             )
-        db_set_bump_amount(inter.guild.id, int(raw))
+        db_set_bump_amount(inter.guild.id, amount)
         await inter.response.edit_message(embed=_build_bump_settings_embed(inter.guild, inter.user), view=self.view_ref)
 
 class BumpRewardView(disnake.ui.View):
