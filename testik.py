@@ -80,6 +80,9 @@ ALLOWED_COUNTRY_LIST = []  # список доступен всем
 ALLOWED_REG_COUNTRY = ["Administrator"]
 ALLOWED_UNREG_COUNTRY = ["Administrator"]
 
+# ID канала для подсчёта сообщений-новостей
+NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
+
 def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
     """
     Возвращает True, если член сервера имеет доступ на основе списка allowed.
@@ -270,13 +273,14 @@ def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQ
     - ``кк`` или ``млн`` / ``миллион`` – миллионы
     - ``ккк`` или ``млрд`` / ``миллиард`` – миллиарды
 
+    В числах допускаются десятичные точки и запятые (``18,3к`` или ``18.3млн``).
     Также проверяется выход за пределы допустимого диапазона SQLite.
     """
     
     try:
         if isinstance(v, str):
-            s = (v or "").strip().lower().replace(" ", "")
-            m = re.fullmatch(r'([+-]?\d+)(ккк|кк|к|млрд|млн|миллиард|миллион)?', s)
+            s = (v or "").strip().lower().replace(" ", "").replace(",", ".")
+            m = re.fullmatch(r'([+-]?\d+(?:\.\d+)?)(ккк|кк|к|млрд|млн|миллиард|миллион)?', s)
             if not m:
                 raise ValueError
             num, suffix = m.groups()
@@ -290,7 +294,7 @@ def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQ
                 "млрд": 1_000_000_000,
                 "миллиард": 1_000_000_000,
             }
-            iv = int(num) * mult_map[suffix]
+            iv = int(float(num) * mult_map[suffix])
         else:
             iv = int(v)
     except Exception:
@@ -594,11 +598,17 @@ def setup_country_tables():
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_countries_name ON countries (guild_id, name)")
-    # Миграция license_role_id
+    # Миграция дополнительных колонок
     c.execute("PRAGMA table_info(countries)")
     cols = {row[1] for row in c.fetchall()}
     if "license_role_id" not in cols:
         c.execute("ALTER TABLE countries ADD COLUMN license_role_id INTEGER")
+    if "government_form" not in cols:
+        c.execute("ALTER TABLE countries ADD COLUMN government_form TEXT")
+    if "ideology" not in cols:
+        c.execute("ALTER TABLE countries ADD COLUMN ideology TEXT")
+    if "religion" not in cols:
+        c.execute("ALTER TABLE countries ADD COLUMN religion TEXT")
     conn.commit()
     conn.close()
 
@@ -744,6 +754,17 @@ def country_get_registration_for_user(guild_id: int, user_id: int) -> Optional[s
     conn.close()
     return row[0] if row else None
 
+def country_get_registration_info(guild_id: int, user_id: int) -> Optional[tuple[str, int]]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        "SELECT code, registered_ts FROM country_registrations WHERE guild_id=? AND user_id=?",
+        (guild_id, user_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    return (row[0], int(row[1])) if row else None
+
 def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
@@ -751,6 +772,40 @@ def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else None
+
+def country_update_system(
+    guild_id: int,
+    code: str,
+    *,
+    form: Optional[str] = None,
+    ideology: Optional[str] = None,
+    religion: Optional[str] = None,
+) -> None:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    fields = []
+    params: list = []
+    if form is not None:
+        fields.append("government_form=?")
+        params.append(form)
+    if ideology is not None:
+        fields.append("ideology=?")
+        params.append(ideology)
+    if religion is not None:
+        fields.append("religion=?")
+        params.append(religion)
+    if not fields:
+        conn.close()
+        return
+    fields.append("updated_ts=?")
+    params.append(_now_ts())
+    params.extend([guild_id, code.strip().upper()])
+    c.execute(
+        f"UPDATE countries SET {', '.join(fields)} WHERE guild_id=? AND upper(code)=upper(?)",
+        params,
+    )
+    conn.commit()
+    conn.close()
 
 def country_delete(guild_id: int, code_or_name: str) -> tuple[bool, str | None, Optional[str]]:
     """
@@ -1609,6 +1664,375 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
     e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
     await ctx.send(embed=e)
 # ============================================
+
+
+class CountryProfileSelect(disnake.ui.StringSelect):
+    """Простое меню выбора страниц профиля страны."""
+
+    def __init__(self, target: disnake.Member):
+        options = [
+            disnake.SelectOption(
+                label="О стране:",
+                value="about",
+                description="Основная информация",
+                default=True,
+            ),
+            disnake.SelectOption(
+                label="Государственное устройство",
+                value="gov",
+                description="Управление государством",
+            ),
+        ]
+        super().__init__(
+            placeholder="Меню профиля",
+            options=options,
+            custom_id="country_profile_select",
+        )
+        self.target = target
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if self.values and self.values[0] == "gov":
+            view = GovernmentView(self.target)
+            await inter.response.send_message(
+                embed=view.build_embed(), view=view, ephemeral=True
+            )
+            try:
+                view.message = await inter.original_message()
+            except Exception:
+                view.message = None
+        else:
+            await inter.response.defer()
+
+
+class CountryProfileView(disnake.ui.View):
+    def __init__(self, target: disnake.Member):
+        super().__init__(timeout=120)
+        self.add_item(CountryProfileSelect(target))
+
+
+class GovernmentView(disnake.ui.View):
+    def __init__(self, target: disnake.Member):
+        super().__init__(timeout=120)
+        self.target = target
+        self.message: disnake.Message | None = None
+        self.country_code = country_get_registration_for_user(target.guild.id, target.id)
+        info = (
+            country_get_by_code_or_name(target.guild.id, self.country_code)
+            if self.country_code
+            else None
+        )
+        self.form = info.get("government_form") if info else None
+        self.ideology = info.get("ideology") if info else None
+        self.religion = info.get("religion") if info else None
+
+    def build_embed(self) -> disnake.Embed:
+        e = disnake.Embed(
+            title="Государственное устройство",
+            description=(
+                "Здесь вы можете изменить свой государственный строй.\n"
+                "При изменение обязательно обыгрывайте РП. Иначе вам будет выдано предупреждение от РП кураторов.\n"
+                "Совет: обсуждайте с РП куратором смену государственного строя.\n\n"
+                f"**Форма правления:**\n{self.form or 'Не установлено.'}\n"
+                f"**Идеология:**\n{self.ideology or 'Не установлено.'}\n"
+                f"**Религия:**\n{self.religion or 'Не установлено.'}"
+            ),
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(
+            name=self.target.display_name,
+            icon_url=self.target.display_avatar.replace(size=64).url,
+        )
+        return e
+
+    @disnake.ui.button(label="Форма правления", style=disnake.ButtonStyle.primary)
+    async def form_btn(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.send_message(
+            "Выберите форму правления:", view=FormSelectView(self), ephemeral=True
+        )
+
+    @disnake.ui.button(label="Идеология", style=disnake.ButtonStyle.primary)
+    async def ideology_btn(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.send_message(
+            "Выберите идеологию:", view=IdeologySelectView(self), ephemeral=True
+        )
+
+    @disnake.ui.button(label="Религия", style=disnake.ButtonStyle.primary)
+    async def religion_btn(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.send_message(
+            "Выберите религию:", view=ReligionSelectView(self), ephemeral=True
+        )
+
+
+class FormSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: GovernmentView):
+        options = [
+            disnake.SelectOption(label="Парламентская республика", emoji="⚖️"),
+            disnake.SelectOption(label="Президентская республика", emoji="🤵"),
+            disnake.SelectOption(label="Смешанная республика", emoji="🔄"),
+            disnake.SelectOption(label="Теократическая республика", emoji="🛐"),
+            disnake.SelectOption(label="Парламентская монархия", emoji="🏛"),
+            disnake.SelectOption(label="Дуалистическая монархия", emoji="✏️"),
+            disnake.SelectOption(label="Абсолютная монархия", emoji="👑"),
+            disnake.SelectOption(label="Военная диктатура", emoji="🎖️"),
+        ]
+        super().__init__(placeholder="Форма правления", options=options)
+        self.parent_view = parent_view
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        label = self.values[0]
+        embed = disnake.Embed(
+            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
+        )
+        await inter.response.edit_message(
+            embed=embed, content=None, view=FormConfirmView(self.parent_view, label)
+        )
+
+
+class FormSelectView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView):
+        super().__init__(timeout=60)
+        self.add_item(FormSelect(parent_view))
+
+
+class FormConfirmView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView, label: str):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.label = label
+
+    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
+    async def choose(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        self.parent_view.form = self.label
+        if self.parent_view.country_code:
+            country_update_system(
+                inter.guild.id, self.parent_view.country_code, form=self.label
+            )
+        if self.parent_view.message:
+            await self.parent_view.message.edit(
+                embed=self.parent_view.build_embed(), view=self.parent_view
+            )
+        await inter.response.edit_message(
+            content="Форма правления сохранена.", embed=None, view=None
+        )
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.edit_message(
+            content="Выберите форму правления:", embed=None, view=FormSelectView(self.parent_view)
+        )
+
+
+class IdeologySelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: GovernmentView):
+        options = [
+            disnake.SelectOption(label="Консерватизм", emoji="📯"),
+            disnake.SelectOption(label="Монархизм", emoji="👑"),
+            disnake.SelectOption(label="Либерализм", emoji="🕊"),
+            disnake.SelectOption(label="Социализм", emoji="⚒️"),
+            disnake.SelectOption(label="Национализм", emoji="🦅"),
+            disnake.SelectOption(label="Технократия", emoji="⚙️"),
+            disnake.SelectOption(label="Фашизм", emoji="🛡"),
+            disnake.SelectOption(label="Нацизм", emoji="☠️"),
+            disnake.SelectOption(label="Социал-демократия", emoji="🌹"),
+            disnake.SelectOption(label="Исламизм", emoji="☪️"),
+            disnake.SelectOption(label="Анархизм", emoji="🏴"),
+            disnake.SelectOption(label="Коммунизм", emoji="🚩"),
+            disnake.SelectOption(label="Милитаризм", emoji="⚔️"),
+            disnake.SelectOption(label="Либертарианство", emoji="🦅"),
+        ]
+        super().__init__(placeholder="Идеология", options=options)
+        self.parent_view = parent_view
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        label = self.values[0]
+        embed = disnake.Embed(
+            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
+        )
+        await inter.response.edit_message(
+            embed=embed, content=None, view=IdeologyConfirmView(self.parent_view, label)
+        )
+
+
+class IdeologySelectView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView):
+        super().__init__(timeout=60)
+        self.add_item(IdeologySelect(parent_view))
+
+
+class IdeologyConfirmView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView, label: str):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.label = label
+
+    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
+    async def choose(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        self.parent_view.ideology = self.label
+        if self.parent_view.country_code:
+            country_update_system(
+                inter.guild.id, self.parent_view.country_code, ideology=self.label
+            )
+        if self.parent_view.message:
+            await self.parent_view.message.edit(
+                embed=self.parent_view.build_embed(), view=self.parent_view
+            )
+        await inter.response.edit_message(
+            content="Идеология сохранена.", embed=None, view=None
+        )
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.edit_message(
+            content="Выберите идеологию:", embed=None, view=IdeologySelectView(self.parent_view)
+        )
+
+
+class ReligionSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: GovernmentView):
+        options = [
+            disnake.SelectOption(label="Православие", emoji="☦️"),
+            disnake.SelectOption(label="Католицизм", emoji="✝️"),
+            disnake.SelectOption(label="Протестантизм", emoji="✝️"),
+            disnake.SelectOption(label="Ислам", emoji="☪️"),
+            disnake.SelectOption(label="Буддизм", emoji="☸️"),
+            disnake.SelectOption(label="Индуизм", emoji="🕉"),
+            disnake.SelectOption(label="Иудаизм", emoji="✡️"),
+            disnake.SelectOption(label="Язычество", emoji="📿"),
+            disnake.SelectOption(label="Атеизм", emoji="🚫"),
+        ]
+        super().__init__(placeholder="Религия", options=options)
+        self.parent_view = parent_view
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        label = self.values[0]
+        embed = disnake.Embed(
+            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
+        )
+        await inter.response.edit_message(
+            embed=embed, content=None, view=ReligionConfirmView(self.parent_view, label)
+        )
+
+
+class ReligionSelectView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView):
+        super().__init__(timeout=60)
+        self.add_item(ReligionSelect(parent_view))
+
+
+class ReligionConfirmView(disnake.ui.View):
+    def __init__(self, parent_view: GovernmentView, label: str):
+        super().__init__(timeout=60)
+        self.parent_view = parent_view
+        self.label = label
+
+    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
+    async def choose(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        self.parent_view.religion = self.label
+        if self.parent_view.country_code:
+            country_update_system(
+                inter.guild.id, self.parent_view.country_code, religion=self.label
+            )
+        if self.parent_view.message:
+            await self.parent_view.message.edit(
+                embed=self.parent_view.build_embed(), view=self.parent_view
+            )
+        await inter.response.edit_message(
+            content="Религия сохранена.", embed=None, view=None
+        )
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(
+        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
+    ):
+        await inter.response.edit_message(
+            content="Выберите религию:", embed=None, view=ReligionSelectView(self.parent_view)
+        )
+
+
+@bot.command(name="моястрана")
+async def my_country_cmd(
+    ctx: commands.Context, member: Optional[disnake.Member] = None
+):
+    """Показывает профиль страны пользователя."""
+
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    if member and member != ctx.author and not ctx.author.guild_permissions.administrator:
+        return await ctx.send(
+            embed=error_embed(
+                "Доступ запрещён", "Просматривать чужой профиль может только администратор."
+            )
+        )
+
+    target = member or ctx.author
+    reg_info = country_get_registration_info(ctx.guild.id, target.id)
+    if not reg_info:
+        e = disnake.Embed(
+            description="Вы не зарегистрированы на страну.",
+            color=disnake.Color.red(),
+        )
+        e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+        e.set_thumbnail(url=target.display_avatar.replace(size=256).url)
+        return await ctx.send(embed=e)
+
+    code, reg_ts = reg_info
+    info = country_get_by_code_or_name(ctx.guild.id, code)
+    if not info:
+        return await ctx.send(embed=error_embed("Ошибка", "Данные страны не найдены."))
+
+    sea = (
+        _fmt_bool(bool(info.get("sea_access")))
+        if info.get("sea_access") is not None
+        else "—"
+    )
+
+    reg_dt = datetime.fromtimestamp(reg_ts)
+    news_count = 0
+    news_channel = ctx.guild.get_channel(NEWS_CHANNEL_ID)
+    if isinstance(news_channel, disnake.TextChannel):
+        async for msg in news_channel.history(limit=None, after=reg_dt):
+            if msg.author.id == target.id:
+                news_count += 1
+
+    e = disnake.Embed(title="Информация:", color=disnake.Color.blurple())
+    e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+    e.set_thumbnail(url=target.display_avatar.replace(size=256).url)
+    e.add_field(name="Пользователь:", value=target.mention, inline=False)
+    e.add_field(name="Страна:", value=info.get("name") or "—", inline=False)
+    e.add_field(name="Правитель:", value=info.get("ruler") or "—", inline=False)
+    e.add_field(name="Континент:", value=info.get("continent") or "—", inline=False)
+    e.add_field(
+        name="Территория:",
+        value=f"{format_number(info.get('territory_km2') or 0)} км²",
+        inline=False,
+    )
+    e.add_field(
+        name="Население:",
+        value=f"{format_number(info.get('population') or 0)}",
+        inline=False,
+    )
+    e.add_field(name="Выход в море:", value=sea, inline=False)
+    e.add_field(
+        name="Зарегистрировался:", value=reg_dt.strftime("%d.%m.%Y %H:%M"), inline=False
+    )
+    e.add_field(name="Количество новостей:", value=str(news_count), inline=False)
+    await ctx.send(embed=e, view=CountryProfileView(target))
 
 
 def setup_shop_tables():
