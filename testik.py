@@ -262,30 +262,35 @@ MIN_SQL_INT = -9_223_372_036_854_775_808
 
 
 def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQL_INT) -> int:
-    """Преобразует значение в int, поддерживая суффиксы вида "7к", "7кк", "7млн", "7млрд".
+    """Преобразует значение в ``int``, поддерживая человеко-понятные суффиксы.
 
-    Также проверяет выход за пределы допустимого диапазона SQLite.
+    Поддерживаемые суффиксы (регистр не важен, пробелы игнорируются):
+
+    - ``к`` – тысячи
+    - ``кк`` или ``млн`` / ``миллион`` – миллионы
+    - ``ккк`` или ``млрд`` / ``миллиард`` – миллиарды
+
+    Также проверяется выход за пределы допустимого диапазона SQLite.
     """
-
+    
     try:
         if isinstance(v, str):
-            s = v.strip().lower().replace(" ", "")
-            multiplier = 1
-            if s.endswith("млрд"):
-                multiplier = 1_000_000_000
-                s = s[:-4]
-            elif s.endswith("млн"):
-                multiplier = 1_000_000
-                s = s[:-3]
-            elif s.endswith("кк"):
-                multiplier = 1_000_000
-                s = s[:-2]
-            elif s.endswith("к"):
-                multiplier = 1_000
-                s = s[:-1]
-            if s in ("", "+", "-"):
+            s = (v or "").strip().lower().replace(" ", "")
+            m = re.fullmatch(r'([+-]?\d+)(ккк|кк|к|млрд|млн|миллиард|миллион)?', s)
+            if not m:
                 raise ValueError
-            iv = int(s) * multiplier
+            num, suffix = m.groups()
+            mult_map = {
+                None: 1,
+                "к": 1_000,
+                "кк": 1_000_000,
+                "млн": 1_000_000,
+                "миллион": 1_000_000,
+                "ккк": 1_000_000_000,
+                "млрд": 1_000_000_000,
+                "миллиард": 1_000_000_000,
+            }
+            iv = int(num) * mult_map[suffix]
         else:
             iv = int(v)
     except Exception:
@@ -6804,7 +6809,7 @@ class WBPercentModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
-        raw = (inter.text_values.get("wb_percent") or "").strip()
+        raw = (inter.text_values.get("wb_percent") or "")
         try:
             val = safe_int(raw, name="Процент", min_v=1, max_v=10)
         except ValueError as e:
@@ -6833,7 +6838,7 @@ class WBWithdrawModal(disnake.ui.Modal):
     async def callback(self, inter: disnake.ModalInteraction):
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
-        raw = (inter.text_values.get("wb_withdraw") or "").replace(" ", "").strip()
+        raw = inter.text_values.get("wb_withdraw") or ""
         try:
             amount = safe_int(raw, name="Сумма", min_v=1)
         except ValueError as e:
@@ -6869,7 +6874,7 @@ class WBDepositModal(disnake.ui.Modal):
         # Пополнять может любой желающий — но можно ограничить так же, как и управление:
         if not _wb_is_manager(inter.user):
             return await inter.response.send_message("Недостаточно прав.", ephemeral=True)
-        raw = (inter.text_values.get("wb_deposit") or "").replace(" ", "").strip()
+        raw = inter.text_values.get("wb_deposit") or ""
         try:
             amount = safe_int(raw, name="Сумма", min_v=1)
         except ValueError as e:
