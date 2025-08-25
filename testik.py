@@ -271,6 +271,17 @@ def setup_database():
         )
     """)
 
+    # Доходные роли: кулдауны по стране
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS country_role_income_cooldowns (
+            guild_id INTEGER,
+            role_id INTEGER,
+            code TEXT,
+            last_ts INTEGER,
+            PRIMARY KEY (guild_id, role_id, code)
+        )
+    """)
+
 # Логи доходных ролей: конфигурация канала логов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS guild_logs (
@@ -632,6 +643,10 @@ def admin_clear_role_incomes(guild_id: int) -> tuple[int, int]:
     c.execute("SELECT COUNT(*) FROM role_income_cooldowns WHERE guild_id = ?", (guild_id,))
     cds_deleted = int(c.fetchone()[0] or 0)
     c.execute("DELETE FROM role_income_cooldowns WHERE guild_id = ?", (guild_id,))
+
+    c.execute("SELECT COUNT(*) FROM country_role_income_cooldowns WHERE guild_id = ?", (guild_id,))
+    cds_deleted += int(c.fetchone()[0] or 0)
+    c.execute("DELETE FROM country_role_income_cooldowns WHERE guild_id = ?", (guild_id,))
 
     conn.commit()
     conn.close()
@@ -6265,6 +6280,7 @@ def db_delete_role_income(guild_id: int, role_id: int):
     c = conn.cursor()
     c.execute("DELETE FROM role_incomes WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
     c.execute("DELETE FROM role_income_cooldowns WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
+    c.execute("DELETE FROM country_role_income_cooldowns WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
     conn.commit()
     conn.close()
 
@@ -6293,10 +6309,17 @@ def db_set_role_income_log_channel(guild_id: int, channel_id: Optional[int]):
 def db_get_ri_last_ts(guild_id: int, role_id: int, user_id: int) -> Optional[int]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        SELECT last_ts FROM role_income_cooldowns
-        WHERE guild_id = ? AND role_id = ? AND user_id = ?
-    """, (guild_id, role_id, user_id))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute("""
+            SELECT last_ts FROM country_role_income_cooldowns
+            WHERE guild_id = ? AND role_id = ? AND code = ?
+        """, (guild_id, role_id, code))
+    else:
+        c.execute("""
+            SELECT last_ts FROM role_income_cooldowns
+            WHERE guild_id = ? AND role_id = ? AND user_id = ?
+        """, (guild_id, role_id, user_id))
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else None
@@ -6304,12 +6327,21 @@ def db_get_ri_last_ts(guild_id: int, role_id: int, user_id: int) -> Optional[int
 def db_set_ri_last_ts(guild_id: int, role_id: int, user_id: int, ts: int):
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO role_income_cooldowns (guild_id, role_id, user_id, last_ts)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(guild_id, role_id, user_id) DO UPDATE SET
-            last_ts = excluded.last_ts
-    """, (guild_id, role_id, user_id, ts))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute("""
+            INSERT INTO country_role_income_cooldowns (guild_id, role_id, code, last_ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, role_id, code) DO UPDATE SET
+                last_ts = excluded.last_ts
+        """, (guild_id, role_id, code, ts))
+    else:
+        c.execute("""
+            INSERT INTO role_income_cooldowns (guild_id, role_id, user_id, last_ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, role_id, user_id) DO UPDATE SET
+                last_ts = excluded.last_ts
+        """, (guild_id, role_id, user_id, ts))
     conn.commit()
     conn.close()
 
