@@ -88,6 +88,36 @@ ALLOWED_LIC_INFO = ["Administrator"]
 # Доступ к удалению лицензии
 ALLOWED_DELETE_LIC = ["Administrator"]
 
+# Стоимость передачи лицензии по типам вооружения
+# Измените значения в этом словаре, чтобы настроить рост цены
+LICENSE_PERMISSION_COSTS = {
+    "firearms": 100,
+    "transport_air": 150,
+    "military_air": 200,
+    "transport_fleet": 150,
+    "military_fleet": 250,
+    "ground_tech": 100,
+    "armor_tech": 200,
+    "artillery": 150,
+    "missiles": 300,
+    "air_def": 250,
+    "ammo": 50,
+}
+
+LICENSE_PERMISSION_LIST = [
+    ("firearms", "Огнестрельное оружие"),
+    ("transport_air", "Транспортная авиация"),
+    ("military_air", "Военная авиация"),
+    ("transport_fleet", "Транспортный флот"),
+    ("military_fleet", "Военный флот"),
+    ("ground_tech", "Наземная техника"),
+    ("armor_tech", "Бронетанковая техника"),
+    ("artillery", "Артиллерия"),
+    ("missiles", "Ракетные комплексы"),
+    ("air_def", "ПВО и ПРО"),
+    ("ammo", "Боеприпасы"),
+]
+
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
 
@@ -742,6 +772,16 @@ def setup_country_tables():
             UNIQUE (guild_id, user_id)
         )
     """)
+    
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS country_license_permissions (
+            guild_id INTEGER,
+            license_code TEXT,
+            country_code TEXT,
+            permissions TEXT,
+            PRIMARY KEY (guild_id, license_code, country_code)
+        )
+    """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_countries_name ON countries (guild_id, name)")
     # Миграция дополнительных колонок
     c.execute("PRAGMA table_info(countries)")
@@ -994,6 +1034,46 @@ def country_remove_license(guild_id: int, license_code: str) -> None:
                 "UPDATE countries SET licenses=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
                 (json.dumps(licenses), ts, guild_id, code.strip().upper()),
             )
+    conn.commit()
+    conn.close()
+
+
+def license_permissions_get(
+    guild_id: int, license_code: str, country_code: str
+) -> dict:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        "SELECT permissions FROM country_license_permissions WHERE guild_id=? AND upper(license_code)=upper(?) AND upper(country_code)=upper(?)",
+        (guild_id, license_code.strip().upper(), country_code.strip().upper()),
+    )
+    row = c.fetchone()
+    conn.close()
+    try:
+        return json.loads(row[0]) if row and row[0] else {}
+    except Exception:
+        return {}
+
+
+def license_permissions_set(
+    guild_id: int, license_code: str, country_code: str, perms: dict
+) -> None:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO country_license_permissions (guild_id, license_code, country_code, permissions)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, license_code, country_code)
+        DO UPDATE SET permissions=excluded.permissions
+        """,
+        (
+            guild_id,
+            license_code.strip().upper(),
+            country_code.strip().upper(),
+            json.dumps(perms),
+        ),
+    )
     conn.commit()
     conn.close()
 
@@ -2314,9 +2394,7 @@ class LicenseOperatorsView(disnake.ui.View):
 
     @disnake.ui.button(label="Выдать лицензию", style=disnake.ButtonStyle.success, row=1)
     async def issue(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_message(
-            "Выдача лицензий пока не реализована.", ephemeral=True
-        )
+        await inter.response.send_modal(LicenseIssueModal(self))
 
     @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
     async def prev_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
@@ -2327,6 +2405,207 @@ class LicenseOperatorsView(disnake.ui.View):
     async def next_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
         view = LicenseOperatorsView(self.parent, self.page + 1)
         await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class LicenseIssueModal(disnake.ui.Modal):
+    def __init__(self, parent_view: LicenseOperatorsView):
+        self.parent_view = parent_view
+        # store inputs as attributes so their values can be accessed in callback
+        self.country_name_input = disnake.ui.TextInput(
+            label="Название страны",
+            custom_id="country_name",
+            required=True,
+            max_length=100,
+        )
+        self.country_code_input = disnake.ui.TextInput(
+            label="Флаг или код",
+            custom_id="country_code",
+            required=False,
+            max_length=20,
+        )
+        components = [self.country_name_input, self.country_code_input]
+        super().__init__(title="Выдать лицензию", components=components)
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        # retrieve user-entered values from stored text inputs
+        name = self.country_name_input.value.strip()
+        code_hint = self.country_code_input.value.strip()
+        query = code_hint or name
+        info = country_get_by_code_or_name(inter.guild.id, query)
+        if not info:
+            await inter.response.send_message("Страна не найдена.", ephemeral=True)
+            return
+        view = LicenseIssueView(self.parent_view, info)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+        view.message = inter.message
+
+
+class LicenseIssueView(disnake.ui.View):
+    def __init__(self, parent_view: LicenseOperatorsView, target_info: dict):
+        super().__init__(timeout=120)
+        self.parent_view = parent_view
+        self.target_info = target_info
+        self.author_id = parent_view.parent.parent.target.id
+        self.permissions = {k: False for k, _ in LICENSE_PERMISSION_LIST}
+        self.message: Optional[disnake.Message] = None
+
+    def calculate_cost(self) -> int:
+        return sum(
+            LICENSE_PERMISSION_COSTS.get(k, 0)
+            for k, v in self.permissions.items()
+            if v
+        )
+
+    def build_embed(self) -> disnake.Embed:
+        lines = []
+        for idx, (key, label) in enumerate(LICENSE_PERMISSION_LIST, start=1):
+            status = "разрешено" if self.permissions.get(key) else "запрещено"
+            lines.append(f"{idx}. {label}: {status}")
+        cost = self.calculate_cost()
+        lines.append("")
+        lines.append("Подсказки")
+        lines.append("- Нажмите кнопку \"Управление разрешениями\" для настройки разрешений лицензии для данной страны.")
+        lines.append("- Стоимость выдачи лицензии зависит от выбранных вами разрешений.")
+        lines.append(f"С данными разрешениями цена составляет: {format_price(cost)}")
+        lines.append("")
+        lines.append(
+            f"Вы уверены, что хотите выдать лицензию с данными разрешениями стране \"{self.target_info['name']}\" и потратить \"{format_price(cost)}\""
+        )
+        e = disnake.Embed(
+            title="Выдача лицензии",
+            description="\n".join(lines),
+            color=disnake.Color.blurple(),
+        )
+        return e
+
+    def _update_message(self):
+        if self.message:
+            asyncio.create_task(self.message.edit(embed=self.build_embed(), view=self))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.author_id:
+            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Выдать", style=disnake.ButtonStyle.success)
+    async def issue(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        target_user_id = country_get_occupant(inter.guild.id, self.target_info["code"])
+        if not target_user_id:
+            await inter.response.send_message("Страна не имеет представителя.", ephemeral=True)
+            return
+        cost = self.calculate_cost()
+        owner_info = self.parent_view.parent.parent.info
+        lic_name = build_country_license_name(owner_info)
+        perm_lines = []
+        for key, label in LICENSE_PERMISSION_LIST:
+            status = "Разрешено" if self.permissions.get(key) else "Запрещено"
+            perm_lines.append(f"{label}: {status}")
+        offer_desc = [
+            f"Пользователь {inter.user.mention} предлагает выдать вам лицензию {lic_name} с следующими параметрами:",
+            *perm_lines,
+        ]
+        offer_embed = disnake.Embed(
+            title="Выдача лицензии",
+            description="\n".join(offer_desc),
+            color=disnake.Color.blurple(),
+        )
+        offer_view = LicenseOfferView(
+            inter.guild.id,
+            owner_info["code"],
+            self.target_info["code"],
+            inter.user.id,
+            cost,
+            self.permissions,
+        )
+        member = inter.guild.get_member(target_user_id)
+        await inter.channel.send(content=member.mention if member else None, embed=offer_embed, view=offer_view)
+        btn.disabled = True
+        self._update_message()
+        await inter.response.send_message("Предложение отправлено.", ephemeral=True)
+
+    @disnake.ui.button(label="Управление разрешениями", style=disnake.ButtonStyle.primary)
+    async def manage(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        view = LicensePermissionSelectView(self)
+        await inter.response.send_message("Выберите разрешения:", view=view, ephemeral=True)
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class LicensePermissionSelect(disnake.ui.StringSelect):
+    def __init__(self, issue_view: LicenseIssueView):
+        options = [
+            disnake.SelectOption(
+                label=label,
+                value=key,
+                default=issue_view.permissions.get(key, False),
+            )
+            for key, label in LICENSE_PERMISSION_LIST
+        ]
+        super().__init__(
+            placeholder="Разрешённые категории",
+            options=options,
+            min_values=0,
+            max_values=len(options),
+        )
+        self.issue_view = issue_view
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        selected = set(self.values)
+        for key, _ in LICENSE_PERMISSION_LIST:
+            self.issue_view.permissions[key] = key in selected
+        self.issue_view._update_message()
+        await inter.response.edit_message(content="Разрешения обновлены.", view=None)
+
+
+class LicensePermissionSelectView(disnake.ui.View):
+    def __init__(self, issue_view: LicenseIssueView):
+        super().__init__(timeout=60)
+        self.add_item(LicensePermissionSelect(issue_view))
+
+
+class LicenseOfferView(disnake.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        license_code: str,
+        country_code: str,
+        issuer_id: int,
+        cost: int,
+        permissions: dict,
+    ):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.license_code = license_code
+        self.country_code = country_code
+        self.issuer_id = issuer_id
+        self.cost = cost
+        self.permissions = permissions
+        self.target_user_id = country_get_occupant(guild_id, country_code)
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.target_user_id:
+            await inter.response.send_message("Это предложение предназначено не вам.", ephemeral=True)
+            return False
+        return True
+
+    @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
+    async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if get_balance(self.guild_id, self.issuer_id) < self.cost:
+            await inter.response.send_message("У отправителя недостаточно средств.", ephemeral=True)
+            return
+        update_balance(self.guild_id, self.issuer_id, -self.cost)
+        country_add_license(self.guild_id, self.country_code, self.license_code)
+        license_permissions_set(
+            self.guild_id, self.license_code, self.country_code, self.permissions
+        )
+        await inter.response.edit_message(content="Лицензия принята.", embed=None, view=None)
+
+    @disnake.ui.button(label="Отказаться", style=disnake.ButtonStyle.danger)
+    async def decline(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(content="Вы отказались от лицензии.", embed=None, view=None)
 
 class LicenseCreateConfirmView(disnake.ui.View):
     def __init__(self, parent: CountryLicensesView):
