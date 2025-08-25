@@ -12,7 +12,7 @@ import math
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Union, Optional
+from typing import Union, Optional, Callable, Awaitable
 from typing import Optional, List
 from datetime import timedelta
 
@@ -121,7 +121,7 @@ LICENSE_PERMISSION_LIST = [
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
 # ID канала, на который будут отправляться заявки на создание техники 
-TECH_APPLICATION_CHANNEL_ID = 123456789012345678 # Укажите идентификатор канала для заявок 
+TECH_APPLICATION_CHANNEL_ID = 1373273403775127555 # Укажите идентификатор канала для заявок 
 
 def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
     """
@@ -327,6 +327,18 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS guild_logs (
             guild_id INTEGER PRIMARY KEY,
             role_income_log_channel_id INTEGER
+        )
+    """)
+
+    # Типы техники
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tech_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            name TEXT,
+            branch TEXT,
+            price INTEGER DEFAULT 0,
+            required_items TEXT
         )
     """)
 
@@ -3247,6 +3259,122 @@ def suggest_items(guild_id: int, query: str, limit: int = 5) -> list[str]:
     result = [r[0] for r in c.fetchall()]
     conn.close()
     return result
+
+
+def compute_tech_type_price(guild_id: int, items: list[tuple[str, int]]) -> int:
+    """Вычисляет суммарную стоимость типа техники по цене составляющих предметов."""
+    total = 0
+    for name, qty in items:
+        item = get_item_by_name(guild_id, name)
+        if item and isinstance(item.get("price"), int):
+            total += int(item["price"]) * int(qty)
+    return total
+
+
+def add_tech_type(guild_id: int, name: str, branch: str, items: list[tuple[str, int]]) -> int:
+    """Сохраняет тип техники в БД и возвращает его ID."""
+    price = compute_tech_type_price(guild_id, items)
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO tech_types (guild_id, name, branch, price, required_items)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (guild_id, name, branch, price, json.dumps(items) if items else None),
+    )
+    conn.commit()
+    type_id = c.lastrowid
+    conn.close()
+    return type_id
+
+
+def get_tech_types_by_branch(guild_id: int, branch: str) -> list[dict]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, price FROM tech_types
+        WHERE guild_id = ? AND branch = ?
+        ORDER BY name
+        """,
+        (guild_id, branch),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "name": r[1], "price": r[2]} for r in rows]
+
+
+def get_tech_type_by_id(guild_id: int, type_id: int) -> Optional[dict]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, branch, price, required_items
+        FROM tech_types
+        WHERE guild_id = ? AND id = ?
+        """,
+        (guild_id, type_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "name": row[1],
+        "branch": row[2],
+        "price": row[3],
+        "required_items": json.loads(row[4]) if row[4] else [],
+    }
+
+
+def add_shop_item_simple(guild_id: int, name: str, price: int, description: str = "") -> None:
+    """Добавляет предмет в магазин с минимальными параметрами."""
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO items (
+            guild_id, name, name_lower, price, sell_price, description,
+            buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
+            per_user_daily_limit, roles_required_buy, roles_required_sell,
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            guild_id,
+            name,
+            name.lower(),
+            price,
+            None,
+            description,
+            "currency",
+            None,
+            1,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        ),
+    )
+    item_id = c.lastrowid
+    try:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO item_shop_state (guild_id, item_id, current_stock, last_restock_ymd)
+            VALUES (?, ?, ?, ?)
+            """,
+            (guild_id, item_id, None, ymd_utc()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 def list_items_db(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(get_db_path())
@@ -9292,6 +9420,38 @@ class TechBranchPickView(disnake.ui.View):
         self.add_item(TechBranchSelect(view_ref))
 
 
+class ExistingTechTypeSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view, types: list[dict]):
+        options = [
+            disnake.SelectOption(
+                label=t["name"],
+                value=str(t["id"]),
+                description=f"Цена: {format_number(t['price'])} {MONEY_EMOJI}"
+            )
+            for t in types
+        ]
+        super().__init__(placeholder="Выберите тип техники", options=options, custom_id="existing_tech_type")
+        self.parent_view = parent_view
+        self._map = {str(t["id"]): t for t in types}
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        info = self._map.get(self.values[0])
+        if not info:
+            return await inter.response.send_message("Некорректный выбор.", ephemeral=True)
+        self.parent_view.tech_type = info["name"]
+        self.parent_view.tech_type_id = info["id"]
+        self.parent_view.tech_price = info.get("price")
+        await inter.response.edit_message(content="Тип выбран.", view=None)
+        if self.parent_view.message:
+            await self.parent_view.message.edit(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class ExistingTechTypePickView(disnake.ui.View):
+    def __init__(self, parent_view, types: list[dict]):
+        super().__init__(timeout=60)
+        self.add_item(ExistingTechTypeSelect(parent_view, types))
+
+
 class TechTypeView(disnake.ui.View):
     def __init__(self, ctx: commands.Context):
         super().__init__(timeout=180)
@@ -9302,10 +9462,17 @@ class TechTypeView(disnake.ui.View):
         self.items: list[tuple[str, int]] = []
 
     def build_embed(self) -> disnake.Embed:
-        e = disnake.Embed(title="Создание типа техники:", color=disnake.Color.blurple())
+        e = disnake.Embed(title="Создание типа техники", color=disnake.Color.blurple())
         _server_icon_and_name(e, self.ctx.guild, self.ctx.bot.user)
-        lines = [""]
-        lines.append("> Требуемые предметы:")
+        lines = [
+            "- Название:",
+            f"> {self.type_name or 'не указано'}",
+            "",
+            "- Выбранный род:",
+            f"> {self.branch or 'не выбран'}",
+            "",
+            "> Требуемые предметы:",
+        ]
         if not self.items:
             lines.append("—")
         else:
@@ -9342,7 +9509,16 @@ class TechTypeView(disnake.ui.View):
 
     @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.primary)
     async def create(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_message("Тип техники сохранён (заглушка).", ephemeral=True)
+        if not self.type_name or not self.branch:
+            return await inter.response.send_message(
+                "Укажите название и род вооружения перед сохранением.",
+                ephemeral=True,
+            )
+        type_id = add_tech_type(self.ctx.guild.id, self.type_name, self.branch, self.items)
+        await inter.response.send_message(
+            f"Тип техники сохранён. ID: {type_id}",
+            ephemeral=True,
+        )
         self.stop()
 
 
@@ -9425,19 +9601,62 @@ class TechCreateSelect(disnake.ui.StringSelect):
             if not self.parent_view.branch:
                 await inter.response.send_message("Сначала выберите род.", ephemeral=True)
             else:
-                await inter.response.send_message("Выбор типа техники пока не реализован.", ephemeral=True)
+                types = get_tech_types_by_branch(inter.guild.id, self.parent_view.branch)
+                if not types:
+                    await inter.response.send_message("Нет доступных типов для выбранного рода.", ephemeral=True)
+                else:
+                    view = ExistingTechTypePickView(self.parent_view, types)
+                    await inter.response.send_message("Выберите тип техники:", view=view, ephemeral=True)
+            return
 
 
 class TechApplicationModerationView(disnake.ui.View):
-    def __init__(self, applicant: disnake.Member):
+    def __init__(self, applicant: disnake.Member, data: dict):
         super().__init__(timeout=3600)
         self.applicant = applicant
+        self.data = data
+        self.message: disnake.Message | None = None
+
+    def build_embed(self) -> disnake.Embed:
+        e = disnake.Embed(title="Заявка на технику", color=disnake.Color.blurple())
+        e.set_author(name=self.applicant.display_name, icon_url=self.applicant.display_avatar.url)
+        lines = [
+            "- Название",
+            f"> {self.data.get('name') or 'не указано'}",
+            "",
+            "- Род вооружения:",
+            f"> {self.data.get('branch') or 'не выбран'}",
+            "",
+            "- Тип",
+            f"> {self.data.get('tech_type_name') or 'не выбран'}",
+            "",
+            "- Цена:",
+            f"> {format_number(self.data.get('tech_price')) + ' ' + MONEY_EMOJI if self.data.get('tech_price') is not None else '—'}",
+            "",
+            "- Описание:",
+            f"> {self.data.get('description') or 'не указано'}",
+            "",
+            "Ссылка на Wikipedia:",
+            f"> {self.data.get('wiki') or 'не указана'}",
+            "",
+            "Лицензия:",
+            f"> {self.data.get('license') or '—'}",
+        ]
+        e.description = "\n".join(lines)
+        return e
 
     @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
     async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        type_id = self.data.get("tech_type_id")
+        price = 0
+        if type_id:
+            info = get_tech_type_by_id(inter.guild.id, type_id)
+            if info:
+                price = int(info.get("price") or 0)
+        add_shop_item_simple(inter.guild.id, self.data.get("name") or "Предмет", price, self.data.get("description") or "")
         await inter.response.send_message("Заявка принята.", ephemeral=True)
         with contextlib.suppress(Exception):
-            await self.applicant.send("Ваша техника одобрена.")
+            await self.applicant.send(f"Ваша техника '{self.data.get('name')}' одобрена.")
         self.stop()
 
     @disnake.ui.button(label="Отклонить", style=disnake.ButtonStyle.danger)
@@ -9445,6 +9664,34 @@ class TechApplicationModerationView(disnake.ui.View):
         modal = TechRejectModal(self.applicant)
         await inter.response.send_modal(modal)
         self.stop()
+
+    @disnake.ui.button(label="Изменить", style=disnake.ButtonStyle.secondary)
+    async def edit(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        async def on_submit(view: CountryTechCreateView, i: disnake.MessageInteraction):
+            self.data.update({
+                "name": view.name,
+                "branch": view.branch,
+                "tech_type_id": view.tech_type_id,
+                "tech_type_name": view.tech_type,
+                "tech_price": view.tech_price,
+                "description": view.description,
+                "wiki": view.wiki,
+            })
+            if self.message:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            await i.response.send_message("Изменено.", ephemeral=True)
+            view.stop()
+
+        view = CountryTechCreateView(self.applicant, inter.user.id, on_submit=on_submit)
+        view.name = self.data.get("name")
+        view.branch = self.data.get("branch")
+        view.tech_type_id = self.data.get("tech_type_id")
+        view.tech_type = self.data.get("tech_type_name")
+        view.tech_price = self.data.get("tech_price")
+        view.description = self.data.get("description")
+        view.wiki = self.data.get("wiki")
+        await inter.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+        view.message = await inter.original_message()
 
 
 class TechRejectModal(disnake.ui.Modal):
@@ -9463,14 +9710,17 @@ class TechRejectModal(disnake.ui.Modal):
 
 
 class CountryTechCreateView(disnake.ui.View):
-    def __init__(self, target: disnake.Member, author_id: int):
+    def __init__(self, target: disnake.Member, author_id: int, on_submit: Callable[["CountryTechCreateView", disnake.MessageInteraction], Awaitable[None]] | None = None):
         super().__init__(timeout=180)
         self.target = target
         self.author_id = author_id
+        self.on_submit = on_submit
         self.message: disnake.Message | None = None
         self.name: str | None = None
         self.branch: str | None = None
         self.tech_type: str | None = None
+        self.tech_type_id: int | None = None
+        self.tech_price: int | None = None
         self.description: str | None = None
         self.wiki: str | None = None
 
@@ -9499,13 +9749,16 @@ class CountryTechCreateView(disnake.ui.View):
             "- Тип",
             f"> {self.tech_type or 'не выбран'}",
             "",
+            "- Цена:",
+            f"> {format_number(self.tech_price) + ' ' + MONEY_EMOJI if self.tech_price is not None else '—'}",
+            "",
             "- Описание:",
             f"> {self.description or 'не указано'}",
             "",
-            "Ссылка на Wikipedia:",
+            "- Ссылка на Wikipedia:",
             f"> {self.wiki or 'не указана'}",
             "",
-            "Лицензия:",
+            "- Лицензия:",
             f"> {self.license_name}",
         ]
         e.description = "\n".join(lines)
@@ -9513,13 +9766,30 @@ class CountryTechCreateView(disnake.ui.View):
 
     @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.success)
     async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if self.on_submit:
+            await self.on_submit(self, inter)
+            return
+
+        data = {
+            "name": self.name,
+            "branch": self.branch,
+            "tech_type_id": self.tech_type_id,
+            "tech_type_name": self.tech_type,
+            "tech_price": self.tech_price,
+            "description": self.description,
+            "wiki": self.wiki,
+            "license": self.license_name,
+        }
         channel = inter.guild.get_channel(TECH_APPLICATION_CHANNEL_ID)
         if channel:
-            await channel.send(
+            mod_view = TechApplicationModerationView(self.target, data)
+            embed = mod_view.build_embed()
+            msg = await channel.send(
                 f"Заявка на технику от {self.target.mention}",
-                embed=self.build_embed(),
-                view=TechApplicationModerationView(self.target),
+                embed=embed,
+                view=mod_view,
             )
+            mod_view.message = msg
         await inter.response.send_message("Заявка отправлена.", ephemeral=True)
         self.stop()
 
