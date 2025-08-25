@@ -746,6 +746,8 @@ def setup_country_tables():
     cols = {row[1] for row in c.fetchall()}
     if "license_role_id" not in cols:
         c.execute("ALTER TABLE countries ADD COLUMN license_role_id INTEGER")
+    if "licenses" not in cols:
+        c.execute("ALTER TABLE countries ADD COLUMN licenses TEXT")
     if "government_form" not in cols:
         c.execute("ALTER TABLE countries ADD COLUMN government_form TEXT")
     if "ideology" not in cols:
@@ -790,7 +792,14 @@ def country_get_by_code_or_name(guild_id: int, code_or_name: str) -> Optional[di
         c.execute("SELECT * FROM countries WHERE guild_id=? AND lower(name)=lower(?)", (guild_id, q))
         row = c.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
+    info = dict(row)
+    try:
+        info["licenses"] = json.loads(info.get("licenses") or "[]")
+    except Exception:
+        info["licenses"] = []
+    return info
 
 def country_exists_code(guild_id: int, code: str) -> bool:
     conn = sqlite3.connect(get_db_path())
@@ -925,16 +934,41 @@ def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     return int(row[0]) if row else None
 
 
-def country_set_license_role(guild_id: int, code: str, role_id: int) -> None:
-    """Обновляет ID роли лицензии для указанной страны."""
+def country_get_licenses(guild_id: int, code: str) -> list[str]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute(
-        "UPDATE countries SET license_role_id=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
-        (role_id, _now_ts(), guild_id, code.strip().upper()),
+        "SELECT licenses FROM countries WHERE guild_id=? AND upper(code)=upper(?)",
+        (guild_id, code.strip().upper()),
     )
-    conn.commit()
+    row = c.fetchone()
     conn.close()
+    if not row or not row[0]:
+        return []
+    try:
+        data = json.loads(row[0])
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def country_add_license(guild_id: int, code: str, license_code: str) -> None:
+    licenses = country_get_licenses(guild_id, code)
+    if license_code not in licenses:
+        licenses.append(license_code)
+        conn = sqlite3.connect(get_db_path())
+        c = conn.cursor()
+        c.execute(
+            "UPDATE countries SET licenses=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
+            (json.dumps(licenses), _now_ts(), guild_id, code.strip().upper()),
+        )
+        conn.commit()
+        conn.close()
+
+
+def country_has_license(guild_id: int, code: str, license_code: str) -> bool:
+    licenses = country_get_licenses(guild_id, code)
+    return license_code in licenses
 
 def country_update_system(
     guild_id: int,
@@ -1003,6 +1037,10 @@ def countries_list_all(guild_id: int) -> list[dict]:
     conn.close()
     for r in rows:
         r["registered_user_id"] = reg.get((r["code"] or "").upper())
+        try:
+            r["licenses"] = json.loads(r.get("licenses") or "[]")
+        except Exception:
+            r["licenses"] = []
     return rows
 
 def country_register_user(guild_id: int, code: str, user_id: int) -> tuple[bool, str | None]:
@@ -1187,11 +1225,11 @@ class SeaAccessSelectView(disnake.ui.View):
 
 # ===== Вью выбора лицензии (универсальная) =====
 
-def build_license_pick_embed(invoker: disnake.Member, title: str = "Выбор роли лицензии", current_role_id: Optional[int] = None) -> disnake.Embed:
-    cur_txt = f"Текущая: <@&{current_role_id}>\n" if current_role_id else ""
+def build_license_pick_embed(invoker: disnake.Member, title: str = "Выбор лицензии", current_license: Optional[str] = None) -> disnake.Embed:
+    cur_txt = f"Текущая: {current_license}\n" if current_license else ""
     e = disnake.Embed(
         title=title,
-        description=(cur_txt + "Выберите роль (можно искать) и нажмите «Подтвердить»."),
+        description=(cur_txt + "Выберите лицензию и нажмите «Подтвердить»."),
         color=disnake.Color.from_rgb(88, 101, 242)
     )
     e.set_author(name=invoker.display_name, icon_url=invoker.display_avatar.url)
@@ -1276,25 +1314,25 @@ class CountryLicensePickView(disnake.ui.View):
         self,
         ctx: commands.Context,
         on_pick,
-        current_role_id: Optional[int] = None,
+        current_code: Optional[str] = None,
         timeout: float = 120.0,
     ):
         super().__init__(timeout=timeout)
         self.ctx = ctx
         self.on_pick = on_pick
-        self.current_role_id = current_role_id
+        self.current_code = current_code
         self.message: Optional[disnake.Message] = None
-        self._chosen_role_id: Optional[int] = None
+        self._chosen_code: Optional[str] = None
 
-        rows = [r for r in countries_list_all(ctx.guild.id) if r.get("license_role_id")]
+        rows = [r for r in countries_list_all(ctx.guild.id) if r.get("licenses") and r["code"] in r["licenses"]]
         options: list[disnake.SelectOption] = [
             disnake.SelectOption(
                 label=build_country_license_name(r)[:100],
-                value=str(r["license_role_id"]),
+                value=str(r["code"]),
             )
             for r in rows
         ]
-        options.insert(0, disnake.SelectOption(label="Без лицензии", value="0"))
+        options.insert(0, disnake.SelectOption(label="Без лицензии", value=""))
 
         self.select = disnake.ui.StringSelect(
             custom_id="country_license_pick",
@@ -1311,19 +1349,19 @@ class CountryLicensePickView(disnake.ui.View):
         )
 
         async def on_select(i: disnake.MessageInteraction):
-            self._chosen_role_id = int(self.select.values[0])
+            self._chosen_code = self.select.values[0]
             await i.response.defer()
 
         async def on_confirm(i: disnake.MessageInteraction):
-            if self._chosen_role_id is None:
+            if self._chosen_code is None:
                 return await i.response.send_message("Сначала выберите лицензию.", ephemeral=True)
-            rid = None if self._chosen_role_id == 0 else self._chosen_role_id
-            await self.on_pick(rid, i)
-            if rid is None:
+            code = None if self._chosen_code == "" else self._chosen_code
+            await self.on_pick(code, i)
+            if code is None:
                 name = "Без лицензии"
             else:
-                match = next((r for r in rows if r["license_role_id"] == rid), None)
-                name = build_country_license_name(match) if match else f"ID {rid}"
+                match = next((r for r in rows if r["code"] == code), None)
+                name = build_country_license_name(match) if match else code
             try:
                 await i.response.edit_message(content=f"✅ Лицензия выбрана: {name}", embed=None, view=None)
             except Exception:
@@ -1486,10 +1524,11 @@ class CountryWizard(disnake.ui.View):
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
+        cur = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else None
         emb = build_license_pick_embed(
             invoker=inter.user,
             title="Выбор роли лицензии для страны",
-            current_role_id=self.draft.license_role_id
+            current_license=cur,
         )
 
         picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
@@ -1735,7 +1774,7 @@ class CountryListView(disnake.ui.View):
             if uid:
                 m = self.ctx.guild.get_member(int(uid))
                 user_txt = (m.mention if m else f"<@{uid}>")
-            lic_txt = f"<@&{int(r['license_role_id'])}>" if r.get("license_role_id") else "—"
+            lic_txt = "Есть" if r.get("licenses") and r["code"] in r["licenses"] else "—"
             sea = _fmt_bool(bool(r.get("sea_access"))) if r.get("sea_access") is not None else "—"
             blocks.append(
                 "\n".join([
@@ -1836,7 +1875,7 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
     e.add_field(name="Население", value=f"{format_number(info.get('population') or 0)}", inline=True)
     sea = _fmt_bool(bool(info.get("sea_access"))) if info.get("sea_access") is not None else "—"
     e.add_field(name="Выход в море", value=sea, inline=True)
-    lic_txt = f"<@&{int(info['license_role_id'])}>" if info.get("license_role_id") else "—"
+    lic_txt = "Есть" if info.get("licenses") and info["code"] in info["licenses"] else "—"
     e.add_field(name="Лицензия", value=lic_txt, inline=True)
     await ctx.send(embed=e)
 
@@ -1846,19 +1885,6 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
         desired = desired[:32]
     with contextlib.suppress(Exception):
         await member.edit(nick=desired, reason="Регистрация на страну")
-
-    # Выдача лицензии страны
-    lic_id = info.get("license_role_id")
-    if lic_id:
-        role = ctx.guild.get_role(int(lic_id))
-        if role:
-            can, why = _bot_can_apply(ctx.guild, role, member)
-            if can:
-                with contextlib.suppress(Exception):
-                    await member.add_roles(role, reason="Регистрация на страну — выдача лицензии страны")
-            else:
-                # Не критично: просто сообщим в консоль/лог
-                print(f"[reg-country] Не удалось выдать роль лицензии: {why}")
 
 @bot.command(name="unreg-country")
 async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
@@ -2078,7 +2104,7 @@ class CountryLicensesView(disnake.ui.View):
     async def create_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
         if not self.info:
             return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
-        if self.info.get("license_role_id"):
+        if self.info.get("licenses") and self.info["code"] in self.info["licenses"]:
             return await inter.response.send_message("У страны уже есть лицензия.", ephemeral=True)
         view = LicenseCreateConfirmView(self)
         await inter.response.edit_message(embed=view.build_embed(), view=view)
@@ -2114,14 +2140,11 @@ class LicenseCreateConfirmView(disnake.ui.View):
                 f"Недостаточно средств. Нужно {format_price(cost)}.", ephemeral=True
             )
         name = build_country_license_name(info)
-        role = await inter.guild.create_role(name=name)
-        try:
-            await self.parent.target.add_roles(role, reason="Создание лицензии страны")
-        except Exception:
-            pass
-        country_set_license_role(inter.guild.id, info["code"], role.id)
+        country_add_license(inter.guild.id, info["code"], info["code"])
         update_balance(inter.guild.id, self.parent.target.id, -cost)
-        self.parent.info["license_role_id"] = role.id
+        self.parent.info.setdefault("licenses", [])
+        if info["code"] not in self.parent.info["licenses"]:
+            self.parent.info["licenses"].append(info["code"])
         await inter.response.edit_message(content="✅ Лицензия создана.", embed=None, view=None)
 
     @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
@@ -2400,7 +2423,7 @@ async def liclist_cmd(ctx: commands.Context):
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
     rows = countries_list_all(ctx.guild.id)
-    lines = [f"- {build_country_license_name(r)}" for r in rows if r.get("license_role_id")]
+    lines = [f"- {build_country_license_name(r)}" for r in rows if r.get("licenses") and r["code"] in r["licenses"]]
     e = disnake.Embed(
         title="Список лицензий",
         description="\n".join(lines) if lines else "Лицензии отсутствуют.",
@@ -2418,17 +2441,17 @@ async def lic_info_cmd(ctx: commands.Context, *, license_name: str):
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
     info = country_get_by_code_or_name(ctx.guild.id, license_name)
-    if not info or not info.get("license_role_id"):
+    if not info or not (info.get("licenses") and info["code"] in info["licenses"]):
         return await ctx.send(embed=error_embed("Ошибка", "Лицензия не найдена."))
     title = build_country_license_name(info)
     owner_id = country_get_occupant(ctx.guild.id, info["code"])
     owner = ctx.guild.get_member(owner_id) if owner_id else None
-    role = ctx.guild.get_role(int(info["license_role_id"]))
-    operators = [m.mention for m in role.members] if role else []
+    rows = countries_list_all(ctx.guild.id)
+    holders = [r["name"] for r in rows if info["code"] in (r.get("licenses") or [])]
     e = disnake.Embed(title=title, color=disnake.Color.blurple())
     e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
     e.add_field(name="Хозяин:", value=owner.mention if owner else "—", inline=False)
-    e.add_field(name="Операторы:", value="\n".join(operators) if operators else "—", inline=False)
+    e.add_field(name="У кого имеется:", value="\n".join(holders) if holders else "—", inline=False)
     await ctx.send(embed=e)
 
 
@@ -2473,7 +2496,8 @@ def setup_shop_tables():
     addcol("roles_granted_on_buy", "roles_granted_on_buy TEXT")
     addcol("roles_removed_on_buy", "roles_removed_on_buy TEXT")
     addcol("disallow_sell", "disallow_sell INTEGER DEFAULT 0")
-    addcol("license_role_id", "license_role_id INTEGER")  # <<< НОВОЕ
+    addcol("license_role_id", "license_role_id INTEGER")
+    addcol("license_code", "license_code TEXT")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS item_shop_state (
@@ -2644,7 +2668,7 @@ def get_item_by_name(guild_id: int, name: str) -> Optional[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
         FROM items
         WHERE guild_id = ? AND name_lower = ?
     """, (guild_id, (name or "").strip().lower()))
@@ -2674,7 +2698,7 @@ def list_items_db(guild_id: int) -> list[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
         FROM items
         WHERE guild_id = ?
         ORDER BY name_lower
@@ -2805,7 +2829,7 @@ ITEMS_COLUMNS = (
     "id, guild_id, name, name_lower, price, sell_price, description, "
     "buy_price_type, cost_items, is_listed, stock_total, restock_per_day, "
     "per_user_daily_limit, roles_required_buy, roles_required_sell, "
-    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id"
+    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code"
 )
 
 def search_items_by_name_or_id(guild_id: int, query: str) -> list[dict]:
@@ -3192,26 +3216,30 @@ def parse_role_ids_from_text(guild: disnake.Guild, text: str) -> list[int]:
             ids.add(role.id)
     return sorted(ids)
 
-def license_block_embed(item: dict, role: Optional[disnake.Role]) -> disnake.Embed:
-    mention = role.mention if role else (f"<@&{int(item['license_role_id'])}>" if item.get('license_role_id') else "—")
+def license_block_embed(item: dict, guild: disnake.Guild) -> disnake.Embed:
+    lic_code = item.get("license_code")
+    if lic_code:
+        info = country_get_by_code_or_name(guild.id, lic_code)
+        name = build_country_license_name(info) if info else lic_code
+    else:
+        name = "—"
     return disnake.Embed(
         title="Покупка недоступна",
         description=(
-            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {mention}.\n"
+            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {name}.\n"
             f"Для получения лицензии обращайтесь к её владельцу."
         ),
         color=disnake.Color.orange()
     )
 
 def user_has_item_license(member: disnake.Member, item: dict) -> bool:
-    lic_id = item.get("license_role_id")
-    if not lic_id:
+    lic_code = item.get("license_code")
+    if not lic_code:
         return True
-    try:
-        lic_id = int(lic_id)
-    except Exception:
-        return True  # некорректная настройка, не блокируем
-    return any(r.id == lic_id for r in member.roles)
+    user_code = country_get_registration_for_user(member.guild.id, member.id)
+    if not user_code:
+        return False
+    return country_has_license(member.guild.id, user_code, lic_code)
 
 class ShopView(disnake.ui.View):
     def __init__(self, ctx: commands.Context, items: list[dict]):
@@ -3431,7 +3459,7 @@ class ItemDraft:
     roles_required_sell: list[int] = field(default_factory=list)
     roles_granted_on_buy: list[int] = field(default_factory=list)
     roles_removed_on_buy: list[int] = field(default_factory=list)
-    license_role_id: Optional[int] = None   # <<< НОВОЕ
+    license_code: Optional[str] = None
 
 
 # Предполагается, что у тебя есть эти функции для работы с БД
@@ -3860,7 +3888,7 @@ class CreateItemWizard(disnake.ui.View):
             self.draft.editing_item_id = int(item_to_edit.get("id")) if item_to_edit.get("id") is not None else None
             self.draft.name = item_to_edit.get("name") or ""
             self.draft.description = item_to_edit.get("description") or ""
-            self.draft.license_role_id = item_to_edit.get("license_role_id")
+            self.draft.license_code = item_to_edit.get("license_code")
             
             # Продажа (!sell)
             self.draft.disallow_sell = int(item_to_edit.get("disallow_sell") or 0)
@@ -4036,7 +4064,11 @@ class CreateItemWizard(disnake.ui.View):
             ),
             inline=False
         )
-        lic_txt = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else "—"
+        if self.draft.license_code:
+            info = country_get_by_code_or_name(self.ctx.guild.id, self.draft.license_code)
+            lic_txt = build_country_license_name(info) if info else self.draft.license_code
+        else:
+            lic_txt = "—"
         e.add_field(
             name="🔖 Лицензия",
             value=f"Лицензия: {lic_txt}",
@@ -4084,19 +4116,24 @@ class CreateItemWizard(disnake.ui.View):
 
     @disnake.ui.button(label="Лицензия", style=disnake.ButtonStyle.secondary, custom_id="step_license", row=3)
     async def _open_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_pick(role_id: Optional[int], i: disnake.MessageInteraction):
-            self.draft.license_role_id = role_id
+        async def on_pick(code: Optional[str], i: disnake.MessageInteraction):
+            self.draft.license_code = code
             if self.message:
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
+        cur_name = None
+        if self.draft.license_code:
+            info = country_get_by_code_or_name(self.ctx.guild.id, self.draft.license_code)
+            if info:
+                cur_name = build_country_license_name(info)
         emb = build_license_pick_embed(
             invoker=inter.user,
             title="Выбор лицензии для предмета",
-            current_role_id=self.draft.license_role_id
+            current_license=cur_name,
         )
 
-        picker = CountryLicensePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
+        picker = CountryLicensePickView(self.ctx, on_pick=on_pick, current_code=self.draft.license_code)
         try:
             await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
         except Exception:
@@ -4154,7 +4191,6 @@ class CreateItemWizard(disnake.ui.View):
 
             is_listed_val = safe_int(1 if self.draft.is_listed else 0, name="Публикация", min_v=0, max_v=1)
             disallow_sell_val = safe_int(self.draft.disallow_sell, name="Запрет продажи", min_v=0, max_v=1)
-            license_role_id_val = safe_optional_int(self.draft.license_role_id, name="Лицензия (роль)", min_v=0)
 
             editing_item_id_val = None
             if self.draft.editing_item_id:
@@ -4173,9 +4209,9 @@ class CreateItemWizard(disnake.ui.View):
                     UPDATE items SET
                         name = ?, name_lower = ?, price = ?, sell_price = ?, description = ?,
                         buy_price_type = ?, cost_items = ?, is_listed = ?, stock_total = ?, 
-                        restock_per_day = ?, per_user_daily_limit = ?, roles_required_buy = ?, 
-                        roles_required_sell = ?, roles_granted_on_buy = ?, roles_removed_on_buy = ?, 
-                        disallow_sell = ?, license_role_id = ?
+                        restock_per_day = ?, per_user_daily_limit = ?, roles_required_buy = ?,
+                        roles_required_sell = ?, roles_granted_on_buy = ?, roles_removed_on_buy = ?,
+                        disallow_sell = ?, license_code = ?
                     WHERE id = ? AND guild_id = ?
                 """, (
                     self.draft.name, self.draft.name.lower(), price_val, sell_price_val, self.draft.description,
@@ -4185,7 +4221,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, license_role_id_val,
+                    disallow_sell_val, self.draft.license_code,
                     editing_item_id_val, guild_id_val
                 ))
                 conn.commit()
@@ -4200,7 +4236,7 @@ class CreateItemWizard(disnake.ui.View):
                         guild_id, name, name_lower, price, sell_price, description,
                         buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
                         per_user_daily_limit, roles_required_buy, roles_required_sell,
-                        roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
+                        roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     guild_id_val, self.draft.name, self.draft.name.lower(), price_val, sell_price_val, self.draft.description,
@@ -4210,7 +4246,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, license_role_id_val
+                    disallow_sell_val, self.draft.license_code
                 ))
                 conn.commit()
                 item_id = c.lastrowid
@@ -4856,17 +4892,12 @@ async def buy_cmd(ctx: commands.Context, *, raw: str):
         ))
 
     # ——— НОВОЕ: проверка лицензии предмета ———
-    lic_id = item.get("license_role_id")
-    if lic_id is not None:
-        try:
-            lic_id = int(lic_id)
-        except Exception:
-            lic_id = None
-    if lic_id:
-        has_license = any(r.id == lic_id for r in ctx.author.roles)
-        if not has_license:
-            lic_role = ctx.guild.get_role(lic_id)
-            mention = lic_role.mention if lic_role else f"<@&{lic_id}>"
+    lic_code = item.get("license_code")
+    if lic_code:
+        user_code = country_get_registration_for_user(ctx.guild.id, ctx.author.id)
+        if not user_code or not country_has_license(ctx.guild.id, user_code, lic_code):
+            info = country_get_by_code_or_name(ctx.guild.id, lic_code)
+            mention = build_country_license_name(info) if info else lic_code
             emb = disnake.Embed(
                 title="Покупка недоступна",
                 description=(
@@ -5113,15 +5144,15 @@ async def item_info_cmd(ctx: commands.Context, *, name: str):
     
     lic_val = "—"
     try:
-        # item тут — нормализованный dict, но license может отсутствовать; достанем сырцом
         conn = sqlite3.connect(get_db_path())
         c = conn.cursor()
-        c.execute("SELECT license_role_id FROM items WHERE guild_id=? AND id=?", (ctx.guild.id, item["id"]))
+        c.execute("SELECT license_code FROM items WHERE guild_id=? AND id=?", (ctx.guild.id, item["id"]))
         row = c.fetchone()
         conn.close()
         if row and row[0]:
-            lic_val = f"<@&{int(row[0])}>"
-    except:
+            info = country_get_by_code_or_name(ctx.guild.id, row[0])
+            lic_val = build_country_license_name(info) if info else row[0]
+    except Exception:
         pass
     embed.add_field(name="🔖 Лицензия", value=lic_val, inline=True)
 
