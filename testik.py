@@ -193,6 +193,25 @@ def setup_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS country_balances (
+            guild_id INTEGER,
+            code TEXT,
+            balance INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, code)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS country_inventories (
+            guild_id INTEGER,
+            code TEXT,
+            item_id INTEGER,
+            quantity INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, code, item_id)
+        )
+    """)
+
     # Рекомендуемый индекс для быстрых запросов топа по балансу
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_balances_guild_balance
@@ -306,26 +325,35 @@ def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQ
 def get_top_balances(guild_id: int, limit: int, offset: int = 0) -> List[Tuple[int, int]]:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT user_id, balance
-        FROM balances
-        WHERE guild_id = ?
-        ORDER BY balance DESC, user_id ASC
-        LIMIT ? OFFSET ?
-    """, (guild_id, limit, offset))
+    cursor.execute("SELECT user_id, balance FROM balances WHERE guild_id = ?", (guild_id,))
     rows = cursor.fetchall()
+    cursor.execute(
+        """
+        SELECT COALESCE(cr.user_id, 0) AS user_id, cb.balance
+        FROM country_balances AS cb
+        LEFT JOIN country_registrations AS cr
+          ON cr.guild_id = cb.guild_id AND UPPER(cr.code)=UPPER(cb.code)
+        WHERE cb.guild_id = ?
+        """,
+        (guild_id,),
+    )
+    rows += cursor.fetchall()
     conn.close()
-    return rows
+    rows.sort(key=lambda r: (-int(r[1]), int(r[0])))
+    return rows[offset:offset + limit]
 
 
 def get_balances_count(guild_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM balances WHERE guild_id = ?", (guild_id,))
-    result = cursor.fetchone()
-    total = result[0] if result and result[0] is not None else 0
+    result_u = cursor.fetchone()
+    cursor.execute("SELECT COUNT(*) FROM country_balances WHERE guild_id = ?", (guild_id,))
+    result_c = cursor.fetchone()
     conn.close()
-    return total
+    total_u = result_u[0] if result_u and result_u[0] is not None else 0
+    total_c = result_c[0] if result_c and result_c[0] is not None else 0
+    return int(total_u + total_c)
 
 # >>> ДОБАВИТЬ ПОСЛЕ СОЗДАНИЯ ТАБЛИЦ И ПЕРЕД conn.commit()
 def ensure_role_incomes_extra_columns():
@@ -369,34 +397,83 @@ def migrate_roles_columns():
 def get_balance(guild_id: int, user_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM balances WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-    result = cursor.fetchone()
-    if result:
-        balance = result[0]
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        cursor.execute(
+            "SELECT balance FROM country_balances WHERE guild_id = ? AND code = ?",
+            (guild_id, code),
+        )
+        result = cursor.fetchone()
+        if result:
+            balance = result[0]
+        else:
+            cursor.execute(
+                "INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, 0)",
+                (guild_id, code),
+            )
+            conn.commit()
+            balance = 0
     else:
-        cursor.execute("INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)", (guild_id, user_id, 0))
-        conn.commit()
-        balance = 0
+        cursor.execute(
+            "SELECT balance FROM balances WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        result = cursor.fetchone()
+        if result:
+            balance = result[0]
+        else:
+            cursor.execute(
+                "INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, 0)",
+                (guild_id, user_id),
+            )
+            conn.commit()
+            balance = 0
     conn.close()
     return balance
 
 def update_balance(guild_id: int, user_id: int, amount: int):
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = balance + ?
-    """, (guild_id, user_id, amount, amount))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        cursor.execute(
+            """
+            INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, code) DO UPDATE SET balance = balance + ?
+            """,
+            (guild_id, code, amount, amount),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = balance + ?
+            """,
+            (guild_id, user_id, amount, amount),
+        )
     conn.commit()
     conn.close()
 
 def set_balance(guild_id: int, user_id: int, new_balance: int):
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
-        ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = excluded.balance
-    """, (guild_id, user_id, new_balance))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        cursor.execute(
+            """
+            INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, code) DO UPDATE SET balance = excluded.balance
+            """,
+            (guild_id, code, new_balance),
+        )
+    else:
+        cursor.execute(
+            """
+            INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = excluded.balance
+            """,
+            (guild_id, user_id, new_balance),
+        )
     conn.commit()
     conn.close()
 
@@ -409,12 +486,21 @@ def admin_reset_inventories(guild_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), COUNT(DISTINCT user_id) FROM inventories WHERE guild_id = ?", (guild_id,))
-    total_rows, users = c.fetchone() or (0, 0)
+    c.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT code) FROM country_inventories WHERE guild_id = ?",
+        (guild_id,),
+    )
+    total_rows_c, countries = c.fetchone() or (0, 0)
+    c.execute("DELETE FROM country_inventories WHERE guild_id = ?", (guild_id,))
+    c.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM inventories WHERE guild_id = ?",
+        (guild_id,),
+    )
+    total_rows_u, users = c.fetchone() or (0, 0)
     c.execute("DELETE FROM inventories WHERE guild_id = ?", (guild_id,))
     conn.commit()
     conn.close()
-    return int(total_rows or 0), int(users or 0)
+    return int((total_rows_c or 0) + (total_rows_u or 0)), int((countries or 0) + (users or 0))
 
 def admin_reset_balances(guild_id: int) -> tuple[int, int, int]:
     """
@@ -423,13 +509,33 @@ def admin_reset_balances(guild_id: int) -> tuple[int, int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM balances WHERE guild_id = ?", (guild_id,))
-    total_rows, sum_before = c.fetchone() or (0, 0)
-    c.execute("UPDATE balances SET balance = 0 WHERE guild_id = ? AND balance != 0", (guild_id,))
-    affected = c.rowcount or 0
+    c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(balance),0) FROM country_balances WHERE guild_id = ?",
+        (guild_id,),
+    )
+    total_rows_c, sum_before_c = c.fetchone() or (0, 0)
+    c.execute(
+        "UPDATE country_balances SET balance = 0 WHERE guild_id = ? AND balance != 0",
+        (guild_id,),
+    )
+    affected_c = c.rowcount or 0
+    c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(balance),0) FROM balances WHERE guild_id = ?",
+        (guild_id,),
+    )
+    total_rows_u, sum_before_u = c.fetchone() or (0, 0)
+    c.execute(
+        "UPDATE balances SET balance = 0 WHERE guild_id = ? AND balance != 0",
+        (guild_id,),
+    )
+    affected_u = c.rowcount or 0
     conn.commit()
     conn.close()
-    return int(affected), int(total_rows or 0), int(sum_before or 0)
+    return (
+        int(affected_c + affected_u),
+        int((total_rows_c or 0) + (total_rows_u or 0)),
+        int((sum_before_c or 0) + (sum_before_u or 0)),
+    )
 
 def admin_reset_worldbank(guild_id: int) -> tuple[int, int]:
     """
@@ -473,11 +579,27 @@ def admin_clear_shop(guild_id: int) -> dict:
     if item_ids:
         # Сколько записей инвентарей будет удалено
         placeholders = ",".join("?" for _ in item_ids)
-        c.execute(f"SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})", (guild_id, *item_ids))
-        stats["inv_rows"] = int(c.fetchone()[0] or 0)
+        c.execute(
+            f"SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
+            (guild_id, *item_ids),
+        )
+        inv_rows_user = int(c.fetchone()[0] or 0)
+        c.execute(
+            f"SELECT COUNT(*) FROM country_inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
+            (guild_id, *item_ids),
+        )
+        inv_rows_country = int(c.fetchone()[0] or 0)
+        stats["inv_rows"] = inv_rows_user + inv_rows_country
 
         # Удалить инвентари по этим предметам
-        c.execute(f"DELETE FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})", (guild_id, *item_ids))
+        c.execute(
+            f"DELETE FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
+            (guild_id, *item_ids),
+        )
+        c.execute(
+            f"DELETE FROM country_inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
+            (guild_id, *item_ids),
+        )
 
     # Состояние магазина
     c.execute("SELECT COUNT(*) FROM item_shop_state WHERE guild_id = ?", (guild_id,))
@@ -2305,10 +2427,23 @@ def list_items_db(guild_id: int) -> list[dict]:
 def get_user_item_qty(guild_id: int, user_id: int, item_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        SELECT quantity FROM inventories
-        WHERE guild_id = ? AND user_id = ? AND item_id = ?
-    """, (guild_id, user_id, item_id))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute(
+            """
+            SELECT quantity FROM country_inventories
+            WHERE guild_id = ? AND code = ? AND item_id = ?
+            """,
+            (guild_id, code, item_id),
+        )
+    else:
+        c.execute(
+            """
+            SELECT quantity FROM inventories
+            WHERE guild_id = ? AND user_id = ? AND item_id = ?
+            """,
+            (guild_id, user_id, item_id),
+        )
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else 0
@@ -2318,12 +2453,27 @@ def add_items_to_user(guild_id: int, user_id: int, item_id: int, amount: int):
         return
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO inventories (guild_id, user_id, item_id, quantity)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
-            quantity = inventories.quantity + excluded.quantity
-    """, (guild_id, user_id, item_id, amount))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute(
+            """
+            INSERT INTO country_inventories (guild_id, code, item_id, quantity)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, code, item_id) DO UPDATE SET
+                quantity = country_inventories.quantity + excluded.quantity
+            """,
+            (guild_id, code, item_id, amount),
+        )
+    else:
+        c.execute(
+            """
+            INSERT INTO inventories (guild_id, user_id, item_id, quantity)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
+                quantity = inventories.quantity + excluded.quantity
+            """,
+            (guild_id, user_id, item_id, amount),
+        )
     conn.commit()
     conn.close()
 
@@ -2332,24 +2482,61 @@ def remove_items_from_user(guild_id: int, user_id: int, item_id: int, amount: in
         return False
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        SELECT quantity FROM inventories
-        WHERE guild_id = ? AND user_id = ? AND item_id = ?
-    """, (guild_id, user_id, item_id))
-    row = c.fetchone()
-    if not row or row[0] < amount:
-        conn.close()
-        return False
-    new_q = row[0] - amount
-    if new_q == 0:
-        c.execute("DELETE FROM inventories WHERE guild_id = ? AND user_id = ? AND item_id = ?",
-                  (guild_id, user_id, item_id))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute(
+            """
+            SELECT quantity FROM country_inventories
+            WHERE guild_id = ? AND code = ? AND item_id = ?
+            """,
+            (guild_id, code, item_id),
+        )
+        row = c.fetchone()
+        if not row or row[0] < amount:
+            conn.close()
+            return False
+        new_q = row[0] - amount
+        if new_q == 0:
+            c.execute(
+                "DELETE FROM country_inventories WHERE guild_id = ? AND code = ? AND item_id = ?",
+                (guild_id, code, item_id),
+            )
+        else:
+            c.execute(
+                """
+                UPDATE country_inventories
+                SET quantity = ?
+                WHERE guild_id = ? AND code = ? AND item_id = ?
+                """,
+                (new_q, guild_id, code, item_id),
+            )
     else:
-        c.execute("""
-            UPDATE inventories
-            SET quantity = ?
+        c.execute(
+            """
+            SELECT quantity FROM inventories
             WHERE guild_id = ? AND user_id = ? AND item_id = ?
-        """, (new_q, guild_id, user_id, item_id))
+            """,
+            (guild_id, user_id, item_id),
+        )
+        row = c.fetchone()
+        if not row or row[0] < amount:
+            conn.close()
+            return False
+        new_q = row[0] - amount
+        if new_q == 0:
+            c.execute(
+                "DELETE FROM inventories WHERE guild_id = ? AND user_id = ? AND item_id = ?",
+                (guild_id, user_id, item_id),
+            )
+        else:
+            c.execute(
+                """
+                UPDATE inventories
+                SET quantity = ?
+                WHERE guild_id = ? AND user_id = ? AND item_id = ?
+                """,
+                (new_q, guild_id, user_id, item_id),
+            )
     conn.commit()
     conn.close()
     return True
@@ -2391,19 +2578,40 @@ def db_reset_user_inventory(guild_id: int, user_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
+    code = country_get_registration_for_user(guild_id, user_id)
     try:
-        # Считаем, чтобы вернуть статистику
-        c.execute("""
-            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-            FROM inventories
-            WHERE guild_id = ? AND user_id = ?
-        """, (guild_id, user_id))
-        row = c.fetchone()
-        distinct_items = int(row[0] or 0)
-        total_qty = int(row[1] or 0)
-
-        # Удаляем
-        c.execute("DELETE FROM inventories WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        if code:
+            c.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+                FROM country_inventories
+                WHERE guild_id = ? AND code = ?
+                """,
+                (guild_id, code),
+            )
+            row = c.fetchone()
+            distinct_items = int(row[0] or 0)
+            total_qty = int(row[1] or 0)
+            c.execute(
+                "DELETE FROM country_inventories WHERE guild_id = ? AND code = ?",
+                (guild_id, code),
+            )
+        else:
+            c.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+                FROM inventories
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+            row = c.fetchone()
+            distinct_items = int(row[0] or 0)
+            total_qty = int(row[1] or 0)
+            c.execute(
+                "DELETE FROM inventories WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
         conn.commit()
         return distinct_items, total_qty
     finally:
@@ -2415,11 +2623,25 @@ def db_get_user_inventory_stats(guild_id: int, user_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-        FROM inventories
-        WHERE guild_id = ? AND user_id = ?
-    """, (guild_id, user_id))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+            FROM country_inventories
+            WHERE guild_id = ? AND code = ?
+            """,
+            (guild_id, code),
+        )
+    else:
+        c.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+            FROM inventories
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        )
     row = c.fetchone()
     conn.close()
     return int(row[0] or 0), int(row[1] or 0)
@@ -4182,10 +4404,28 @@ async def delete_item_cmd(ctx: commands.Context, *, item_query: str = ""):
     c = conn.cursor()
 
     # Сколько всего экземпляров предмета у пользователей и у скольких пользователей он есть
-    c.execute("SELECT COALESCE(SUM(quantity), 0) FROM inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
-    total_qty = int(c.fetchone()[0] or 0)
-    c.execute("SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0", (guild_id, item_id))
-    holders = int(c.fetchone()[0] or 0)
+    c.execute(
+        "SELECT COALESCE(SUM(quantity), 0) FROM inventories WHERE guild_id = ? AND item_id = ?",
+        (guild_id, item_id),
+    )
+    total_qty_user = int(c.fetchone()[0] or 0)
+    c.execute(
+        "SELECT COALESCE(SUM(quantity), 0) FROM country_inventories WHERE guild_id = ? AND item_id = ?",
+        (guild_id, item_id),
+    )
+    total_qty_country = int(c.fetchone()[0] or 0)
+    total_qty = total_qty_user + total_qty_country
+    c.execute(
+        "SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0",
+        (guild_id, item_id),
+    )
+    holders_user = int(c.fetchone()[0] or 0)
+    c.execute(
+        "SELECT COUNT(*) FROM country_inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0",
+        (guild_id, item_id),
+    )
+    holders_country = int(c.fetchone()[0] or 0)
+    holders = holders_user + holders_country
 
     # Сколько ссылок на этот предмет в стоимостях других предметов
     c.execute("SELECT id, name, cost_items FROM items WHERE guild_id = ? AND id != ?", (guild_id, item_id))
@@ -4262,6 +4502,7 @@ async def delete_item_cmd(ctx: commands.Context, *, item_query: str = ""):
 
         # Удаляем записи инвентарей
         c.execute("DELETE FROM inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
+        c.execute("DELETE FROM country_inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
         # Удаляем состояние склада и дневные лимиты
         c.execute("DELETE FROM item_shop_state WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
         c.execute("DELETE FROM item_user_daily WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
@@ -4639,14 +4880,31 @@ def list_user_inventory_db(guild_id: int, user_id: int) -> list[dict]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute("""
-        SELECT i.id, i.name, i.description, inv.quantity
-        FROM inventories AS inv
-        JOIN items AS i
-          ON i.id = inv.item_id AND i.guild_id = inv.guild_id
-        WHERE inv.guild_id = ? AND inv.user_id = ?
-        ORDER BY i.name_lower
-    """, (guild_id, user_id))
+    code = country_get_registration_for_user(guild_id, user_id)
+    if code:
+        c.execute(
+            """
+            SELECT i.id, i.name, i.description, inv.quantity
+            FROM country_inventories AS inv
+            JOIN items AS i
+              ON i.id = inv.item_id AND i.guild_id = inv.guild_id
+            WHERE inv.guild_id = ? AND inv.code = ?
+            ORDER BY i.name_lower
+            """,
+            (guild_id, code),
+        )
+    else:
+        c.execute(
+            """
+            SELECT i.id, i.name, i.description, inv.quantity
+            FROM inventories AS inv
+            JOIN items AS i
+              ON i.id = inv.item_id AND i.guild_id = inv.guild_id
+            WHERE inv.guild_id = ? AND inv.user_id = ?
+            ORDER BY i.name_lower
+            """,
+            (guild_id, user_id),
+        )
     rows = c.fetchall()
     conn.close()
     return [
@@ -4655,7 +4913,8 @@ def list_user_inventory_db(guild_id: int, user_id: int) -> list[dict]:
             "name": r[1],
             "description": r[2] or "",
             "quantity": int(r[3]),
-        } for r in rows
+        }
+        for r in rows
     ]
 
 
