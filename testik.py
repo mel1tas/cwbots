@@ -80,6 +80,12 @@ ALLOWED_COUNTRY_LIST = []  # список доступен всем
 ALLOWED_REG_COUNTRY = ["Administrator"]
 ALLOWED_UNREG_COUNTRY = ["Administrator"]
 
+# Стоимость строительства военного завода (для создания лицензии)
+LICENSE_FACTORY_COST = 1000  # можете изменить стоимость по своему усмотрению
+
+# Доступ к команде !lic-info (по умолчанию только администраторы)
+ALLOWED_LIC_INFO = ["Administrator"]
+
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
 
@@ -883,6 +889,14 @@ def normalize_flag_emoji(flag_raw: str, code_hint: Optional[str] = None) -> str:
     # Если уже юникод-флаг — возвращаем как есть
     return s
 
+
+def build_country_license_name(info: dict) -> str:
+    """Формирует отображаемое название лицензии страны."""
+    flag = normalize_flag_emoji(info.get("flag"), code_hint=info.get("code"))
+    name = info.get("name") or ""
+    code = info.get("code") or ""
+    return f"[{flag}] Лицензия {name} ({code})"
+
 def country_get_registration_for_user(guild_id: int, user_id: int) -> Optional[str]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
@@ -909,6 +923,18 @@ def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else None
+
+
+def country_set_license_role(guild_id: int, code: str, role_id: int) -> None:
+    """Обновляет ID роли лицензии для указанной страны."""
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        "UPDATE countries SET license_role_id=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
+        (role_id, _now_ts(), guild_id, code.strip().upper()),
+    )
+    conn.commit()
+    conn.close()
 
 def country_update_system(
     guild_id: int,
@@ -1233,6 +1259,87 @@ class LicenseRolePickView(disnake.ui.View):
         self.btn_cancel.callback = on_cancel
 
         self.add_item(self.role_select)
+        self.add_item(self.btn_confirm)
+        self.add_item(self.btn_cancel)
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.ctx.author.id:
+            await inter.response.send_message("Это меню не для вас.", ephemeral=True)
+            return False
+        return True
+
+
+class CountryLicensePickView(disnake.ui.View):
+    """Выбор лицензии из списка стран."""
+
+    def __init__(
+        self,
+        ctx: commands.Context,
+        on_pick,
+        current_role_id: Optional[int] = None,
+        timeout: float = 120.0,
+    ):
+        super().__init__(timeout=timeout)
+        self.ctx = ctx
+        self.on_pick = on_pick
+        self.current_role_id = current_role_id
+        self.message: Optional[disnake.Message] = None
+        self._chosen_role_id: Optional[int] = None
+
+        rows = [r for r in countries_list_all(ctx.guild.id) if r.get("license_role_id")]
+        options: list[disnake.SelectOption] = [
+            disnake.SelectOption(
+                label=build_country_license_name(r)[:100],
+                value=str(r["license_role_id"]),
+            )
+            for r in rows
+        ]
+        options.insert(0, disnake.SelectOption(label="Без лицензии", value="0"))
+
+        self.select = disnake.ui.StringSelect(
+            custom_id="country_license_pick",
+            placeholder="Выберите лицензию",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.btn_confirm = disnake.ui.Button(
+            label="Подтвердить", style=disnake.ButtonStyle.primary, custom_id="country_license_confirm"
+        )
+        self.btn_cancel = disnake.ui.Button(
+            label="Отмена", style=disnake.ButtonStyle.secondary, custom_id="country_license_cancel"
+        )
+
+        async def on_select(i: disnake.MessageInteraction):
+            self._chosen_role_id = int(self.select.values[0])
+            await i.response.defer()
+
+        async def on_confirm(i: disnake.MessageInteraction):
+            if self._chosen_role_id is None:
+                return await i.response.send_message("Сначала выберите лицензию.", ephemeral=True)
+            rid = None if self._chosen_role_id == 0 else self._chosen_role_id
+            await self.on_pick(rid, i)
+            if rid is None:
+                name = "Без лицензии"
+            else:
+                match = next((r for r in rows if r["license_role_id"] == rid), None)
+                name = build_country_license_name(match) if match else f"ID {rid}"
+            try:
+                await i.response.edit_message(content=f"✅ Лицензия выбрана: {name}", embed=None, view=None)
+            except Exception:
+                await i.followup.send(f"✅ Лицензия выбрана: {name}", ephemeral=True)
+
+        async def on_cancel(i: disnake.MessageInteraction):
+            try:
+                await i.response.edit_message(content="Отменено.", view=None, embed=None)
+            except Exception:
+                await i.followup.send("Отменено.", ephemeral=True)
+
+        self.select.callback = on_select
+        self.btn_confirm.callback = on_confirm
+        self.btn_cancel.callback = on_cancel
+
+        self.add_item(self.select)
         self.add_item(self.btn_confirm)
         self.add_item(self.btn_cancel)
 
@@ -1819,6 +1926,11 @@ class CountryProfileSelect(disnake.ui.StringSelect):
                 value="gov",
                 description="Управление государством",
             ),
+            disnake.SelectOption(
+                label="Лицензии",
+                value="licenses",
+                description="Информация о лицензиях",
+            ),
         ]
         super().__init__(
             placeholder="Меню профиля",
@@ -1835,17 +1947,25 @@ class CountryProfileSelect(disnake.ui.StringSelect):
             )
             return
         
-        if self.values and self.values[0] == "gov":
-            view = GovernmentView(self.target, self.author_id)
-            await inter.response.send_message(
-                embed=view.build_embed(), view=view
-            )
-            try:
-                view.message = await inter.original_message()
-            except Exception:
-                view.message = None
-        else:
-            await inter.response.defer()
+        if self.values:
+            val = self.values[0]
+            if val == "gov":
+                view = GovernmentView(self.target, self.author_id)
+                await inter.response.send_message(embed=view.build_embed(), view=view)
+                try:
+                    view.message = await inter.original_message()
+                except Exception:
+                    view.message = None
+                return
+            if val == "licenses":
+                view = CountryLicensesView(self.target, self.author_id)
+                await inter.response.send_message(embed=view.build_embed(), view=view)
+                try:
+                    view.message = await inter.original_message()
+                except Exception:
+                    view.message = None
+                return
+        await inter.response.defer()
 
 
 class CountryProfileView(disnake.ui.View):
@@ -1921,6 +2041,92 @@ class GovernmentView(disnake.ui.View):
             "Выберите религию:", view=ReligionSelectView(self), ephemeral=True
         )
 
+
+class CountryLicensesView(disnake.ui.View):
+    def __init__(self, target: disnake.Member, author_id: int):
+        super().__init__(timeout=120)
+        self.target = target
+        self.author_id = author_id
+        self.message: Optional[disnake.Message] = None
+        self.country_code = country_get_registration_for_user(target.guild.id, target.id)
+        self.info = (
+            country_get_by_code_or_name(target.guild.id, self.country_code)
+            if self.country_code
+            else None
+        )
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.author_id:
+            await inter.response.send_message("Эта панель доступна только вызвавшему команду.", ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self) -> disnake.Embed:
+        e = disnake.Embed(
+            title="Лицензии",
+            description=(
+                "Лицензия - это специальный документ, который необходим для производства техники.\n\n"
+                "Информация:\n"
+                "- Нажмите кнопку \"Создать лицензию\" - для создания своей лицензии, вам понадобится заплатить за строительство военного завода по производству техники."
+            ),
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
+        return e
+
+    @disnake.ui.button(label="Создать лицензию", style=disnake.ButtonStyle.success)
+    async def create_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not self.info:
+            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
+        if self.info.get("license_role_id"):
+            return await inter.response.send_message("У страны уже есть лицензия.", ephemeral=True)
+        view = LicenseCreateConfirmView(self)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class LicenseCreateConfirmView(disnake.ui.View):
+    def __init__(self, parent: CountryLicensesView):
+        super().__init__(timeout=120)
+        self.parent = parent
+
+    def build_embed(self) -> disnake.Embed:
+        cost = LICENSE_FACTORY_COST
+        e = disnake.Embed(
+            title="Лицензии",
+            description=(
+                f"- Стоимость строительства военного завода по производству техники составляет: {format_price(cost)}\n"
+                "- Для подтверждения создания лицензии нажмите кнопку \"Подтвердить\"."
+            ),
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(name=self.parent.target.display_name, icon_url=self.parent.target.display_avatar.url)
+        return e
+
+    @disnake.ui.button(label="Подтвердить", style=disnake.ButtonStyle.success)
+    async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        info = self.parent.info
+        if not info:
+            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
+        cost = LICENSE_FACTORY_COST
+        balance = get_balance(inter.guild.id, self.parent.target.id)
+        if balance < cost:
+            return await inter.response.send_message(
+                f"Недостаточно средств. Нужно {format_price(cost)}.", ephemeral=True
+            )
+        name = build_country_license_name(info)
+        role = await inter.guild.create_role(name=name)
+        try:
+            await self.parent.target.add_roles(role, reason="Создание лицензии страны")
+        except Exception:
+            pass
+        country_set_license_role(inter.guild.id, info["code"], role.id)
+        update_balance(inter.guild.id, self.parent.target.id, -cost)
+        self.parent.info["license_role_id"] = role.id
+        await inter.response.edit_message(content="✅ Лицензия создана.", embed=None, view=None)
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(embed=self.parent.build_embed(), view=self.parent)
 
 class FormSelect(disnake.ui.StringSelect):
     def __init__(self, parent_view: GovernmentView):
@@ -2186,6 +2392,44 @@ async def my_country_cmd(
     )
     e.add_field(name=":newspaper: Количество новостей:", value=str(news_count), inline=False)
     await ctx.send(embed=e, view=CountryProfileView(target, ctx.author.id))
+
+
+@bot.command(name="liclist")
+async def liclist_cmd(ctx: commands.Context):
+    """Показать список существующих лицензий."""
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    rows = countries_list_all(ctx.guild.id)
+    lines = [f"- {build_country_license_name(r)}" for r in rows if r.get("license_role_id")]
+    e = disnake.Embed(
+        title="Список лицензий",
+        description="\n".join(lines) if lines else "Лицензии отсутствуют.",
+        color=disnake.Color.blurple(),
+    )
+    e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
+    await ctx.send(embed=e)
+
+
+@bot.command(name="lic-info")
+async def lic_info_cmd(ctx: commands.Context, *, license_name: str):
+    """Информация о конкретной лицензии."""
+    if not await ensure_allowed_ctx(ctx, ALLOWED_LIC_INFO):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    info = country_get_by_code_or_name(ctx.guild.id, license_name)
+    if not info or not info.get("license_role_id"):
+        return await ctx.send(embed=error_embed("Ошибка", "Лицензия не найдена."))
+    title = build_country_license_name(info)
+    owner_id = country_get_occupant(ctx.guild.id, info["code"])
+    owner = ctx.guild.get_member(owner_id) if owner_id else None
+    role = ctx.guild.get_role(int(info["license_role_id"]))
+    operators = [m.mention for m in role.members] if role else []
+    e = disnake.Embed(title=title, color=disnake.Color.blurple())
+    e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
+    e.add_field(name="Хозяин:", value=owner.mention if owner else "—", inline=False)
+    e.add_field(name="Операторы:", value="\n".join(operators) if operators else "—", inline=False)
+    await ctx.send(embed=e)
 
 
 def setup_shop_tables():
@@ -3840,7 +4084,7 @@ class CreateItemWizard(disnake.ui.View):
 
     @disnake.ui.button(label="Лицензия", style=disnake.ButtonStyle.secondary, custom_id="step_license", row=3)
     async def _open_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_pick(role_id: int, i: disnake.MessageInteraction):
+        async def on_pick(role_id: Optional[int], i: disnake.MessageInteraction):
             self.draft.license_role_id = role_id
             if self.message:
                 with contextlib.suppress(Exception):
@@ -3848,11 +4092,11 @@ class CreateItemWizard(disnake.ui.View):
 
         emb = build_license_pick_embed(
             invoker=inter.user,
-            title="Выбор роли лицензии для предмета",
+            title="Выбор лицензии для предмета",
             current_role_id=self.draft.license_role_id
         )
 
-        picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
+        picker = CountryLicensePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
         try:
             await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
         except Exception:
