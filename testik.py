@@ -2110,6 +2110,21 @@ class CountryLicensesView(disnake.ui.View):
             if self.country_code
             else None
         )
+        self.has_license = bool(
+            self.info
+            and self.info.get("licenses")
+            and self.info["code"] in self.info["licenses"]
+        )
+
+        # Удаляем ненужные кнопки в зависимости от наличия лицензии
+        if self.has_license:
+            for child in list(self.children):
+                if getattr(child, "custom_id", "") == "country_create_license":
+                    self.remove_item(child)
+        else:
+            for child in list(self.children):
+                if getattr(child, "custom_id", "") == "country_my_license":
+                    self.remove_item(child)
 
     async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
         if inter.user.id != self.author_id:
@@ -2118,27 +2133,200 @@ class CountryLicensesView(disnake.ui.View):
         return True
 
     def build_embed(self) -> disnake.Embed:
+        desc_lines = [
+            "Лицензия - это специальный документ, который необходим для производства техники.\n",
+            "Информация:",
+            "- Нажмите кнопку \"Список лицензий\" - для просмотра списка имеющихся у вас лицензий на производство техники.",
+        ]
+        if self.has_license:
+            desc_lines.append(
+                "- Нажмите кнопку \"Моя лицензия\" для просмотра информации и действий со своей лицензией."
+            )
+        else:
+            desc_lines.append(
+                "- Нажмите кнопку \"Создать лицензию\" - для создания своей лицензии, вам понадобится заплатить за строительство военного завода по производству техники."
+            )
         e = disnake.Embed(
             title="Лицензии",
-            description=(
-                "Лицензия - это специальный документ, который необходим для производства техники.\n\n"
-                "Информация:\n"
-                "- Нажмите кнопку \"Создать лицензию\" - для создания своей лицензии, вам понадобится заплатить за строительство военного завода по производству техники."
-            ),
+            description="\n".join(desc_lines),
             color=disnake.Color.blurple(),
         )
         e.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
         return e
 
-    @disnake.ui.button(label="Создать лицензию", style=disnake.ButtonStyle.success)
+    @disnake.ui.button(
+        label="Создать лицензию",
+        style=disnake.ButtonStyle.success,
+        custom_id="country_create_license",
+    )
     async def create_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
         if not self.info:
             return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
-        if self.info.get("licenses") and self.info["code"] in self.info["licenses"]:
+        if self.has_license:
             return await inter.response.send_message("У страны уже есть лицензия.", ephemeral=True)
         view = LicenseCreateConfirmView(self)
         await inter.response.edit_message(embed=view.build_embed(), view=view)
 
+    @disnake.ui.button(
+        label="Моя лицензия",
+        style=disnake.ButtonStyle.primary,
+        custom_id="country_my_license",
+    )
+    async def my_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not self.has_license:
+            return await inter.response.send_message("Лицензия не найдена.", ephemeral=True)
+        view = MyLicenseView(self)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+    @disnake.ui.button(
+        label="Список лицензий",
+        style=disnake.ButtonStyle.secondary,
+        custom_id="country_license_list",
+    )
+    async def list_licenses(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not self.info:
+            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
+        view = CountryLicenseListView(self)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class CountryLicenseListView(disnake.ui.View):
+    def __init__(self, parent: CountryLicensesView):
+        super().__init__(timeout=120)
+        self.parent = parent
+
+    def build_embed(self) -> disnake.Embed:
+        codes = country_get_licenses(
+            self.parent.target.guild.id, self.parent.info["code"]
+        )
+        lines = []
+        for code in codes:
+            info = country_get_by_code_or_name(self.parent.target.guild.id, code)
+            if info and info.get("licenses") and info["code"] in info["licenses"]:
+                lines.append(f"- {build_country_license_name(info)}")
+        e = disnake.Embed(
+            title="Список лицензий",
+            description="\n".join(lines) if lines else "Лицензии отсутствуют.",
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(
+            name=self.parent.target.display_name,
+            icon_url=self.parent.target.display_avatar.url,
+        )
+        return e
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(
+            embed=self.parent.build_embed(), view=self.parent
+        )
+
+
+class MyLicenseView(disnake.ui.View):
+    def __init__(self, parent: CountryLicensesView):
+        super().__init__(timeout=120)
+        self.parent = parent
+
+    def build_embed(self) -> disnake.Embed:
+        info = self.parent.info
+        e = disnake.Embed(
+            title=build_country_license_name(info),
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(
+            name=self.parent.target.display_name,
+            icon_url=self.parent.target.display_avatar.url,
+        )
+        e.add_field(name="Страна:", value=info["name"], inline=False)
+        e.add_field(name="Пользователь:", value=self.parent.target.mention, inline=False)
+        hints = "\n".join(
+            [
+                "- Выберите \"Список операторов\" для просмотра стран, которые могут производить технику по вашей лицензии.",
+                "- Выберите \"Список техники\" для просмотра техники, которая доступна к производству по вашей лицензии;",
+                "- Выберите \"Назад к меню\" для возвращения назад",
+            ]
+        )
+        e.add_field(name="Подсказки", value=hints, inline=False)
+        return e
+
+    @disnake.ui.button(label="Список операторов", style=disnake.ButtonStyle.secondary)
+    async def operators(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        view = LicenseOperatorsView(self)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+    @disnake.ui.button(label="Список техники", style=disnake.ButtonStyle.secondary)
+    async def items(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_message(
+            "Функция пока не реализована.", ephemeral=True
+        )
+
+    @disnake.ui.button(label="Назад к меню", style=disnake.ButtonStyle.danger)
+    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(
+            embed=self.parent.build_embed(), view=self.parent
+        )
+
+
+class LicenseOperatorsView(disnake.ui.View):
+    def __init__(self, parent: MyLicenseView, page: int = 0):
+        super().__init__(timeout=120)
+        self.parent = parent
+        self.page = page
+        self.per_page = 5
+        rows = countries_list_all(parent.parent.target.guild.id)
+        self.holders = [
+            r
+            for r in rows
+            if parent.parent.info["code"] in (r.get("licenses") or [])
+        ]
+        if self.page <= 0:
+            self.prev_page.disabled = True
+        if (self.page + 1) * self.per_page >= len(self.holders):
+            self.next_page.disabled = True
+
+    def build_embed(self) -> disnake.Embed:
+        start = self.page * self.per_page
+        end = start + self.per_page
+        chunk = self.holders[start:end]
+        lines = []
+        for r in chunk:
+            user_id = country_get_occupant(
+                self.parent.parent.target.guild.id, r["code"]
+            )
+            mention = f"<@{user_id}>" if user_id else "—"
+            lines.append(f"- {r['name']} — {mention}")
+        e = disnake.Embed(
+            title="Список операторов",
+            description="\n".join(lines) if lines else "Страны-операторы отсутствуют.",
+            color=disnake.Color.blurple(),
+        )
+        e.set_author(
+            name=self.parent.parent.target.display_name,
+            icon_url=self.parent.parent.target.display_avatar.url,
+        )
+        return e
+
+    @disnake.ui.button(label="Назад к меню", style=disnake.ButtonStyle.secondary, row=1)
+    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(
+            embed=self.parent.build_embed(), view=self.parent
+        )
+
+    @disnake.ui.button(label="Выдать лицензию", style=disnake.ButtonStyle.success, row=1)
+    async def issue(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_message(
+            "Выдача лицензий пока не реализована.", ephemeral=True
+        )
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
+    async def prev_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        view = LicenseOperatorsView(self.parent, self.page - 1)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
+
+    @disnake.ui.button(label="Вперёд", style=disnake.ButtonStyle.secondary)
+    async def next_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        view = LicenseOperatorsView(self.parent, self.page + 1)
+        await inter.response.edit_message(embed=view.build_embed(), view=view)
 
 class LicenseCreateConfirmView(disnake.ui.View):
     def __init__(self, parent: CountryLicensesView):
