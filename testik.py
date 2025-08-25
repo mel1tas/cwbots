@@ -2414,7 +2414,7 @@ class LicenseIssueModal(disnake.ui.Modal):
         self.country_name_input = disnake.ui.TextInput(
             label="Название страны",
             custom_id="country_name",
-            required=True,
+            required=False,
             max_length=100,
         )
         self.country_code_input = disnake.ui.TextInput(
@@ -2427,9 +2427,14 @@ class LicenseIssueModal(disnake.ui.Modal):
         super().__init__(title="Выдать лицензию", components=components)
 
     async def callback(self, inter: disnake.ModalInteraction):
-        # retrieve user-entered values from stored text inputs
-        name = self.country_name_input.value.strip()
-        code_hint = self.country_code_input.value.strip()
+        # retrieve user-entered values from modal submission
+        name = inter.text_values.get("country_name", "").strip()
+        code_hint = inter.text_values.get("country_code", "").strip()
+        if not name and not code_hint:
+            await inter.response.send_message(
+                "Укажите название страны или её код.", ephemeral=True
+            )
+            return
         query = code_hint or name
         info = country_get_by_code_or_name(inter.guild.id, query)
         if not info:
