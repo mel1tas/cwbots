@@ -85,6 +85,8 @@ LICENSE_FACTORY_COST = 1000  # можете изменить стоимость 
 
 # Доступ к команде !lic-info (по умолчанию только администраторы)
 ALLOWED_LIC_INFO = ["Administrator"]
+# Доступ к удалению лицензии
+ALLOWED_DELETE_LIC = ["Administrator"]
 
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
@@ -970,6 +972,32 @@ def country_has_license(guild_id: int, code: str, license_code: str) -> bool:
     licenses = country_get_licenses(guild_id, code)
     return license_code in licenses
 
+
+def country_remove_license(guild_id: int, license_code: str) -> None:
+    """Удаляет указанный код лицензии из всех стран гильдии."""
+    license_code = license_code.strip().upper()
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute("SELECT code, licenses FROM countries WHERE guild_id=?", (guild_id,))
+    rows = c.fetchall()
+    ts = _now_ts()
+    for code, lic_json in rows:
+        if not lic_json:
+            continue
+        try:
+            licenses = json.loads(lic_json) or []
+        except Exception:
+            licenses = []
+        if license_code in licenses:
+            licenses = [l for l in licenses if l != license_code]
+            c.execute(
+                "UPDATE countries SET licenses=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
+                (json.dumps(licenses), ts, guild_id, code.strip().upper()),
+            )
+    conn.commit()
+    conn.close()
+
+
 def country_update_system(
     guild_id: int,
     code: str,
@@ -1023,6 +1051,8 @@ def country_delete(guild_id: int, code_or_name: str) -> tuple[bool, str | None, 
         conn.close()
         return False, f"Ошибка удаления: {e}", None
     conn.close()
+    # Удаляем связанные лицензии
+    country_remove_license(guild_id, code)
     return True, None, code
 
 def countries_list_all(guild_id: int) -> list[dict]:
@@ -1332,7 +1362,7 @@ class CountryLicensePickView(disnake.ui.View):
             )
             for r in rows
         ]
-        options.insert(0, disnake.SelectOption(label="Без лицензии", value=""))
+        options.insert(0, disnake.SelectOption(label="Без лицензии", value="none"))
 
         self.select = disnake.ui.StringSelect(
             custom_id="country_license_pick",
@@ -1355,7 +1385,7 @@ class CountryLicensePickView(disnake.ui.View):
         async def on_confirm(i: disnake.MessageInteraction):
             if self._chosen_code is None:
                 return await i.response.send_message("Сначала выберите лицензию.", ephemeral=True)
-            code = None if self._chosen_code == "" else self._chosen_code
+            code = None if self._chosen_code == "none" else self._chosen_code
             await self.on_pick(code, i)
             if code is None:
                 name = "Без лицензии"
@@ -2453,6 +2483,47 @@ async def lic_info_cmd(ctx: commands.Context, *, license_name: str):
     e.add_field(name="Хозяин:", value=owner.mention if owner else "—", inline=False)
     e.add_field(name="У кого имеется:", value="\n".join(holders) if holders else "—", inline=False)
     await ctx.send(embed=e)
+
+
+@bot.command(name="delete-lic")
+async def delete_license_cmd(ctx: commands.Context, *, license_name: str):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_DELETE_LIC):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    info = country_get_by_code_or_name(ctx.guild.id, license_name)
+    if not info or not (info.get("licenses") and info["code"] in info["licenses"]):
+        return await ctx.send(embed=error_embed("Ошибка", "Лицензия не найдена."))
+    warn = disnake.Embed(
+        title="Удаление лицензии",
+        description=f"Вы уверены, что хотите удалить лицензию {info.get('flag') or ''} {info['name']} ({info['code']})?\nВведите в чат: удалить",
+        color=disnake.Color.red(),
+    )
+    prompt = await ctx.send(embed=warn)
+
+    def check(m: disnake.Message):
+        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+
+    try:
+        msg = await ctx.bot.wait_for("message", check=check, timeout=30.0)
+        with contextlib.suppress(Exception):
+            await msg.delete()
+        if msg.content.strip().lower() != "удалить":
+            with contextlib.suppress(Exception):
+                await prompt.delete()
+            return await ctx.send("Удаление отменено.", delete_after=10)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(Exception):
+            await prompt.delete()
+        return await ctx.send("Время на подтверждение истекло.", delete_after=10)
+
+    country_remove_license(ctx.guild.id, info["code"])
+    done = disnake.Embed(
+        title="✅ Удалено",
+        description=f"Лицензия {info.get('flag') or ''} {info['name']} ({info['code']}) удалена.",
+        color=disnake.Color.green(),
+    )
+    await ctx.send(embed=done)
 
 
 def setup_shop_tables():
@@ -4135,10 +4206,15 @@ class CreateItemWizard(disnake.ui.View):
 
         picker = CountryLicensePickView(self.ctx, on_pick=on_pick, current_code=self.draft.license_code)
         try:
-            await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
-        except Exception:
-            await inter.followup.send(embed=emb, view=picker, ephemeral=True)
-
+            if inter.response.is_done():
+                await inter.followup.send(embed=emb, view=picker, ephemeral=True)
+            else:
+                await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
+        except disnake.errors.NotFound:
+            await inter.channel.send(
+                f"{inter.user.mention}, не удалось открыть меню выбора лицензии. Попробуйте снова.")
+            return
+        
         with contextlib.suppress(Exception):
             picker.message = await inter.original_message()
 
