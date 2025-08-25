@@ -120,6 +120,8 @@ LICENSE_PERMISSION_LIST = [
 
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
+# ID канала, на который будут отправляться заявки на создание техники 
+TECH_APPLICATION_CHANNEL_ID = 123456789012345678 # Укажите идентификатор канала для заявок 
 
 def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
     """
@@ -2067,6 +2069,11 @@ class CountryProfileSelect(disnake.ui.StringSelect):
                 value="licenses",
                 description="Информация о лицензиях",
             ),
+            disnake.SelectOption(
+                label="Создание техники",
+                value="tech_create",
+                description="Заявка на технику",
+            ),
         ]
         super().__init__(
             placeholder="Меню профиля",
@@ -2095,6 +2102,14 @@ class CountryProfileSelect(disnake.ui.StringSelect):
                 return
             if val == "licenses":
                 view = CountryLicensesView(self.target, self.author_id)
+                await inter.response.send_message(embed=view.build_embed(), view=view)
+                try:
+                    view.message = await inter.original_message()
+                except Exception:
+                    view.message = None
+                return
+            if val == "tech_create":
+                view = CountryTechCreateView(self.target, self.author_id)
                 await inter.response.send_message(embed=view.build_embed(), view=view)
                 try:
                     view.message = await inter.original_message()
@@ -9212,6 +9227,307 @@ def _mix_color_for(pct_for: int) -> disnake.Color:
     b = 60
     return disnake.Color.from_rgb(r, g, b)
 
+
+# ========================= Создание типов техники =========================
+
+
+class TechTypeNameModal(disnake.ui.Modal):
+    def __init__(self, view_ref):
+        components = [
+            disnake.ui.TextInput(label="Название типа", custom_id="name", max_length=100),
+        ]
+        super().__init__(title="Название типа", components=components)
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        self.view_ref.type_name = inter.text_values.get("name", "").strip()
+        await inter.response.send_message("Название сохранено.", ephemeral=True)
+        if self.view_ref.message:
+            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+
+
+class TechTypeItemModal(disnake.ui.Modal):
+    def __init__(self, view_ref):
+        components = [
+            disnake.ui.TextInput(label="Название предмета", custom_id="item", max_length=100),
+            disnake.ui.TextInput(label="Количество", custom_id="qty", max_length=10),
+        ]
+        super().__init__(title="Добавить предмет", components=components)
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        name = inter.text_values.get("item", "").strip()
+        qty_raw = inter.text_values.get("qty", "").strip()
+        try:
+            qty = int(qty_raw)
+        except ValueError:
+            qty = 0
+        if name and qty > 0:
+            self.view_ref.items.append((name, qty))
+            if self.view_ref.message:
+                await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+        await inter.response.send_message("Предмет добавлен.", ephemeral=True)
+
+
+class TechBranchSelect(disnake.ui.StringSelect):
+    def __init__(self, view_ref):
+        options = [
+            disnake.SelectOption(label=label, value=code) for code, label in LICENSE_PERMISSION_LIST
+        ]
+        super().__init__(placeholder="Выберите род", options=options, custom_id="tech_branch_select")
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        code = self.values[0]
+        mapping = {c: l for c, l in LICENSE_PERMISSION_LIST}
+        self.view_ref.branch = mapping.get(code, code)
+        await inter.response.edit_message(content="Род выбран.", view=None)
+        if self.view_ref.message:
+            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+
+
+class TechBranchPickView(disnake.ui.View):
+    def __init__(self, view_ref):
+        super().__init__(timeout=60)
+        self.add_item(TechBranchSelect(view_ref))
+
+
+class TechTypeView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context):
+        super().__init__(timeout=180)
+        self.ctx = ctx
+        self.message: disnake.Message | None = None
+        self.type_name: str | None = None
+        self.branch: str | None = None
+        self.items: list[tuple[str, int]] = []
+
+    def build_embed(self) -> disnake.Embed:
+        e = disnake.Embed(title="Создание типа техники:", color=disnake.Color.blurple())
+        _server_icon_and_name(e, self.ctx.guild, self.ctx.bot.user)
+        lines = [""]
+        lines.append("> Требуемые предметы:")
+        if not self.items:
+            lines.append("—")
+        else:
+            for name, qty in self.items:
+                lines.append(f"{name} — {qty}")
+        e.description = "\n".join(lines)
+        return e
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        return inter.user.id == self.ctx.author.id
+
+    @disnake.ui.button(label="Название", style=disnake.ButtonStyle.primary)
+    async def set_name(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_modal(TechTypeNameModal(self))
+
+    @disnake.ui.button(label="Выбрать род", style=disnake.ButtonStyle.secondary)
+    async def pick_branch(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        view = TechBranchPickView(self)
+        await inter.response.send_message("Выберите род:", view=view, ephemeral=True)
+
+    @disnake.ui.button(label="Добавить предмет", style=disnake.ButtonStyle.success)
+    async def add_item(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_modal(TechTypeItemModal(self))
+
+    @disnake.ui.button(label="Удалить предмет", style=disnake.ButtonStyle.danger)
+    async def del_item(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if self.items:
+            self.items.pop()
+            if self.message:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            await inter.response.send_message("Последний предмет удалён.", ephemeral=True)
+        else:
+            await inter.response.send_message("Нет предметов для удаления.", ephemeral=True)
+
+    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.primary)
+    async def create(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_message("Тип техники сохранён (заглушка).", ephemeral=True)
+        self.stop()
+
+
+# ========================= Создание техники страной =========================
+
+
+class TechNameModal(disnake.ui.Modal):
+    def __init__(self, view_ref):
+        components = [
+            disnake.ui.TextInput(label="Название", custom_id="name", max_length=100),
+        ]
+        super().__init__(title="Название", components=components)
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        self.view_ref.name = inter.text_values.get("name", "").strip()
+        await inter.response.send_message("Название установлено.", ephemeral=True)
+        if self.view_ref.message:
+            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+
+
+class TechDescriptionModal(disnake.ui.Modal):
+    def __init__(self, view_ref):
+        components = [
+            disnake.ui.TextInput(label="Описание", custom_id="desc", style=disnake.TextInputStyle.paragraph, max_length=500),
+        ]
+        super().__init__(title="Описание", components=components)
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        self.view_ref.description = inter.text_values.get("desc", "").strip()
+        await inter.response.send_message("Описание установлено.", ephemeral=True)
+        if self.view_ref.message:
+            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+
+
+class TechWikiModal(disnake.ui.Modal):
+    def __init__(self, view_ref):
+        components = [
+            disnake.ui.TextInput(label="Ссылка", custom_id="link", max_length=200),
+        ]
+        super().__init__(title="Ссылка на Wikipedia", components=components)
+        self.view_ref = view_ref
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        self.view_ref.wiki = inter.text_values.get("link", "").strip()
+        await inter.response.send_message("Ссылка сохранена.", ephemeral=True)
+        if self.view_ref.message:
+            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
+
+
+class TechCreateSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view):
+        options = [
+            disnake.SelectOption(label="Название", value="name"),
+            disnake.SelectOption(label="Род", value="branch"),
+            disnake.SelectOption(label="Тип", value="type"),
+            disnake.SelectOption(label="Описание", value="description"),
+            disnake.SelectOption(label="Ссылка на Wikipedia", value="wiki"),
+        ]
+        super().__init__(placeholder="Выберите параметр", options=options, custom_id="tech_create_select")
+        self.parent_view = parent_view
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        val = self.values[0]
+        if val == "name":
+            await inter.response.send_modal(TechNameModal(self.parent_view))
+            return
+        if val == "description":
+            await inter.response.send_modal(TechDescriptionModal(self.parent_view))
+            return
+        if val == "wiki":
+            await inter.response.send_modal(TechWikiModal(self.parent_view))
+            return
+        if val == "branch":
+            view = TechBranchPickView(self.parent_view)
+            await inter.response.send_message("Выберите род:", view=view, ephemeral=True)
+            return
+        if val == "type":
+            if not self.parent_view.branch:
+                await inter.response.send_message("Сначала выберите род.", ephemeral=True)
+            else:
+                await inter.response.send_message("Выбор типа техники пока не реализован.", ephemeral=True)
+
+
+class TechApplicationModerationView(disnake.ui.View):
+    def __init__(self, applicant: disnake.Member):
+        super().__init__(timeout=3600)
+        self.applicant = applicant
+
+    @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
+    async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_message("Заявка принята.", ephemeral=True)
+        with contextlib.suppress(Exception):
+            await self.applicant.send("Ваша техника одобрена.")
+        self.stop()
+
+    @disnake.ui.button(label="Отклонить", style=disnake.ButtonStyle.danger)
+    async def reject(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        modal = TechRejectModal(self.applicant)
+        await inter.response.send_modal(modal)
+        self.stop()
+
+
+class TechRejectModal(disnake.ui.Modal):
+    def __init__(self, applicant: disnake.Member):
+        components = [
+            disnake.ui.TextInput(label="Причина", custom_id="reason", style=disnake.TextInputStyle.paragraph),
+        ]
+        super().__init__(title="Причина отказа", components=components)
+        self.applicant = applicant
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        reason = inter.text_values.get("reason", "").strip() or "Причина не указана"
+        with contextlib.suppress(Exception):
+            await self.applicant.send(f"Ваша заявка отклонена: {reason}")
+        await inter.response.send_message("Отказ отправлен.", ephemeral=True)
+
+
+class CountryTechCreateView(disnake.ui.View):
+    def __init__(self, target: disnake.Member, author_id: int):
+        super().__init__(timeout=180)
+        self.target = target
+        self.author_id = author_id
+        self.message: disnake.Message | None = None
+        self.name: str | None = None
+        self.branch: str | None = None
+        self.tech_type: str | None = None
+        self.description: str | None = None
+        self.wiki: str | None = None
+
+        code = country_get_registration_for_user(target.guild.id, target.id)
+        info = country_get_by_code_or_name(target.guild.id, code) if code else None
+        self.license_name = build_country_license_name(info) if info else "—"
+
+        self.add_item(TechCreateSelect(self))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.author_id:
+            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self) -> disnake.Embed:
+        e = disnake.Embed(title="Создание техники", color=disnake.Color.blurple())
+        e.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
+        lines = [
+            "- Название",
+            f"> {self.name or 'не указано'}",
+            "",
+            "- Род вооружения:",
+            f"> {self.branch or 'не выбран'}",
+            "",
+            "- Тип",
+            f"> {self.tech_type or 'не выбран'}",
+            "",
+            "- Описание:",
+            f"> {self.description or 'не указано'}",
+            "",
+            "Ссылка на Wikipedia:",
+            f"> {self.wiki or 'не указана'}",
+            "",
+            "Лицензия:",
+            f"> {self.license_name}",
+        ]
+        e.description = "\n".join(lines)
+        return e
+
+    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.success)
+    async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        channel = inter.guild.get_channel(TECH_APPLICATION_CHANNEL_ID)
+        if channel:
+            await channel.send(
+                f"Заявка на технику от {self.target.mention}",
+                embed=self.build_embed(),
+                view=TechApplicationModerationView(self.target),
+            )
+        await inter.response.send_message("Заявка отправлена.", ephemeral=True)
+        self.stop()
+
+    @disnake.ui.button(label="Отменить", style=disnake.ButtonStyle.secondary)
+    async def cancel(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.edit_message(content="Создание техники отменено.", embed=None, view=None)
+        self.stop()
+
 @dataclass
 class Candidate:
     name: str
@@ -10306,6 +10622,16 @@ async def collect_cmd(ctx: commands.Context):
     e.set_footer(text=f"{ctx.guild.name} • {footer_time}", icon_url=server_icon)
 
     await ctx.send(embed=e)
+
+
+@bot.command(name="type-tech")
+async def type_tech_cmd(ctx: commands.Context):
+    """Открывает меню создания типа техники."""
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    view = TechTypeView(ctx)
+    msg = await ctx.send(embed=view.build_embed(), view=view)
+    view.message = msg
 
 
 @bot.event
