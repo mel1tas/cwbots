@@ -1669,7 +1669,7 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
 class CountryProfileSelect(disnake.ui.StringSelect):
     """Простое меню выбора страниц профиля страны."""
 
-    def __init__(self, target: disnake.Member):
+    def __init__(self, target: disnake.Member, author_id: int):
         options = [
             disnake.SelectOption(
                 label="О стране:",
@@ -1689,12 +1689,19 @@ class CountryProfileSelect(disnake.ui.StringSelect):
             custom_id="country_profile_select",
         )
         self.target = target
+        self.author_id = author_id
 
     async def callback(self, inter: disnake.MessageInteraction):
-        if self.values and self.values[0] == "gov":
-            view = GovernmentView(self.target)
+        if inter.user.id != self.author_id:
             await inter.response.send_message(
-                embed=view.build_embed(), view=view, ephemeral=True
+                "Вы не вызывали эту команду.", ephemeral=True
+            )
+            return
+        
+        if self.values and self.values[0] == "gov":
+            view = GovernmentView(self.target, self.author_id)
+            await inter.response.send_message(
+                embed=view.build_embed(), view=view
             )
             try:
                 view.message = await inter.original_message()
@@ -1705,15 +1712,16 @@ class CountryProfileSelect(disnake.ui.StringSelect):
 
 
 class CountryProfileView(disnake.ui.View):
-    def __init__(self, target: disnake.Member):
+    def __init__(self, target: disnake.Member, author_id: int):
         super().__init__(timeout=120)
-        self.add_item(CountryProfileSelect(target))
+        self.add_item(CountryProfileSelect(target, author_id))
 
 
 class GovernmentView(disnake.ui.View):
-    def __init__(self, target: disnake.Member):
+    def __init__(self, target: disnake.Member, author_id: int):
         super().__init__(timeout=120)
         self.target = target
+        self.author_id = author_id
         self.message: disnake.Message | None = None
         self.country_code = country_get_registration_for_user(target.guild.id, target.id)
         info = (
@@ -1725,6 +1733,14 @@ class GovernmentView(disnake.ui.View):
         self.ideology = info.get("ideology") if info else None
         self.religion = info.get("religion") if info else None
 
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.author_id:
+            await inter.response.send_message(
+                "Эта панель доступна только вызвавшему команду.", ephemeral=True
+            )
+            return False
+        return True
+
     def build_embed(self) -> disnake.Embed:
         e = disnake.Embed(
             title="Государственное устройство",
@@ -1732,8 +1748,8 @@ class GovernmentView(disnake.ui.View):
                 "Здесь вы можете изменить свой государственный строй.\n"
                 "При изменение обязательно обыгрывайте РП. Иначе вам будет выдано предупреждение от РП кураторов.\n"
                 "Совет: обсуждайте с РП куратором смену государственного строя.\n\n"
-                f"**Форма правления:**\n{self.form or 'Не установлено.'}\n"
-                f"**Идеология:**\n{self.ideology or 'Не установлено.'}\n"
+                f"**Форма правления:**\n{self.form or 'Не установлено.'}\n\n"
+                f"**Идеология:**\n{self.ideology or 'Не установлено.'}\n\n"
                 f"**Религия:**\n{self.religion or 'Не установлено.'}"
             ),
             color=disnake.Color.blurple(),
@@ -2010,29 +2026,29 @@ async def my_country_cmd(
             if msg.author.id == target.id:
                 news_count += 1
 
-    e = disnake.Embed(title="Информация:", color=disnake.Color.blurple())
+    e = disnake.Embed(title=":information_source: Информация:", color=disnake.Color.blurple())
     e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
     e.set_thumbnail(url=target.display_avatar.replace(size=256).url)
-    e.add_field(name="Пользователь:", value=target.mention, inline=False)
-    e.add_field(name="Страна:", value=info.get("name") or "—", inline=False)
-    e.add_field(name="Правитель:", value=info.get("ruler") or "—", inline=False)
-    e.add_field(name="Континент:", value=info.get("continent") or "—", inline=False)
+    e.add_field(name=":bust_in_silhouette: Пользователь:", value=target.mention, inline=False)
+    e.add_field(name=":camping: Страна:", value=info.get("name") or "—", inline=False)
+    e.add_field(name=":office_worker: Правитель:", value=info.get("ruler") or "—", inline=False)
+    e.add_field(name=":island: Континент:", value=info.get("continent") or "—", inline=False)
     e.add_field(
-        name="Территория:",
+        name=":map: Территория:",
         value=f"{format_number(info.get('territory_km2') or 0)} км²",
         inline=False,
     )
     e.add_field(
-        name="Население:",
+        name=":busts_in_silhouette: Население:",
         value=f"{format_number(info.get('population') or 0)}",
         inline=False,
     )
-    e.add_field(name="Выход в море:", value=sea, inline=False)
+    e.add_field(name=":anchor: Выход в море:", value=sea, inline=False)
     e.add_field(
-        name="Зарегистрировался:", value=reg_dt.strftime("%d.%m.%Y %H:%M"), inline=False
+        name=":ticket: Зарегистрирован:", value=reg_dt.strftime("%d.%m.%Y %H:%M"), inline=False
     )
-    e.add_field(name="Количество новостей:", value=str(news_count), inline=False)
-    await ctx.send(embed=e, view=CountryProfileView(target))
+    e.add_field(name=":newspaper: Количество новостей:", value=str(news_count), inline=False)
+    await ctx.send(embed=e, view=CountryProfileView(target, ctx.author.id))
 
 
 def setup_shop_tables():
