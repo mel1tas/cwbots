@@ -3329,6 +3329,32 @@ def get_tech_type_by_id(guild_id: int, type_id: int) -> Optional[dict]:
     }
 
 
+def get_all_tech_types(guild_id: int) -> list[dict]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT id, name, branch, price, required_items
+        FROM tech_types
+        WHERE guild_id = ?
+        ORDER BY id
+        """,
+        (guild_id,),
+    )
+    rows = c.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r[0],
+            "name": r[1],
+            "branch": r[2],
+            "price": r[3],
+            "required_items": json.loads(r[4]) if r[4] else [],
+        })
+    return result
+
+
 def add_shop_item_simple(guild_id: int, name: str, price: int, description: str = "") -> None:
     """Добавляет предмет в магазин с минимальными параметрами."""
     conn = sqlite3.connect(get_db_path())
@@ -9411,6 +9437,7 @@ class TechBranchSelect(disnake.ui.StringSelect):
         self.view_ref.branch = mapping.get(code, code)
         await inter.response.edit_message(content="Род выбран.", view=None)
         if self.view_ref.message:
+            self.view_ref._sync_buttons_state()
             await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
 
 
@@ -9441,8 +9468,11 @@ class ExistingTechTypeSelect(disnake.ui.StringSelect):
         self.parent_view.tech_type = info["name"]
         self.parent_view.tech_type_id = info["id"]
         self.parent_view.tech_price = info.get("price")
+        full = get_tech_type_by_id(inter.guild.id, info["id"])
+        self.parent_view.cost_items = full.get("required_items") if full else []
         await inter.response.edit_message(content="Тип выбран.", view=None)
         if self.parent_view.message:
+            self.parent_view._sync_buttons_state()
             await self.parent_view.message.edit(embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
@@ -9537,6 +9567,7 @@ class TechNameModal(disnake.ui.Modal):
         self.view_ref.name = inter.text_values.get("name", "").strip()
         await inter.response.send_message("Название установлено.", ephemeral=True)
         if self.view_ref.message:
+            self.view_ref._sync_buttons_state()
             await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
 
 
@@ -9552,6 +9583,7 @@ class TechDescriptionModal(disnake.ui.Modal):
         self.view_ref.description = inter.text_values.get("desc", "").strip()
         await inter.response.send_message("Описание установлено.", ephemeral=True)
         if self.view_ref.message:
+            self.view_ref._sync_buttons_state()
             await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
 
 
@@ -9567,6 +9599,7 @@ class TechWikiModal(disnake.ui.Modal):
         self.view_ref.wiki = inter.text_values.get("link", "").strip()
         await inter.response.send_message("Ссылка сохранена.", ephemeral=True)
         if self.view_ref.message:
+            self.view_ref._sync_buttons_state()
             await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
 
 
@@ -9631,7 +9664,14 @@ class TechApplicationModerationView(disnake.ui.View):
             f"> {self.data.get('tech_type_name') or 'не выбран'}",
             "",
             "- Цена:",
-            f"> {format_number(self.data.get('tech_price')) + ' ' + MONEY_EMOJI if self.data.get('tech_price') is not None else '—'}",
+        ]
+        items = self.data.get("cost_items") or []
+        if not items:
+            lines.append("> —")
+        else:
+            for name, qty in items:
+                lines.append(f"> {name} — {qty}")
+        lines.extend([
             "",
             "- Описание:",
             f"> {self.data.get('description') or 'не указано'}",
@@ -9641,7 +9681,7 @@ class TechApplicationModerationView(disnake.ui.View):
             "",
             "Лицензия:",
             f"> {self.data.get('license') or '—'}",
-        ]
+        ])
         e.description = "\n".join(lines)
         return e
 
@@ -9674,6 +9714,7 @@ class TechApplicationModerationView(disnake.ui.View):
                 "tech_type_id": view.tech_type_id,
                 "tech_type_name": view.tech_type,
                 "tech_price": view.tech_price,
+                "cost_items": view.cost_items,
                 "description": view.description,
                 "wiki": view.wiki,
             })
@@ -9688,8 +9729,10 @@ class TechApplicationModerationView(disnake.ui.View):
         view.tech_type_id = self.data.get("tech_type_id")
         view.tech_type = self.data.get("tech_type_name")
         view.tech_price = self.data.get("tech_price")
+        view.cost_items = self.data.get("cost_items", [])
         view.description = self.data.get("description")
         view.wiki = self.data.get("wiki")
+        view._sync_buttons_state()
         await inter.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
         view.message = await inter.original_message()
 
@@ -9721,6 +9764,7 @@ class CountryTechCreateView(disnake.ui.View):
         self.tech_type: str | None = None
         self.tech_type_id: int | None = None
         self.tech_price: int | None = None
+        self.cost_items: list[tuple[str, int]] = []
         self.description: str | None = None
         self.wiki: str | None = None
 
@@ -9729,12 +9773,24 @@ class CountryTechCreateView(disnake.ui.View):
         self.license_name = build_country_license_name(info) if info else "—"
 
         self.add_item(TechCreateSelect(self))
+        self._sync_buttons_state()
 
     async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
         if inter.user.id != self.author_id:
             await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
             return False
         return True
+
+    def _sync_buttons_state(self):
+        for child in self.children:
+            if isinstance(child, disnake.ui.Button) and child.custom_id == "country_tech_confirm":
+                child.disabled = not all([
+                    self.name,
+                    self.branch,
+                    self.tech_type_id,
+                    self.description,
+                    self.wiki,
+                ])
 
     def build_embed(self) -> disnake.Embed:
         e = disnake.Embed(title="Создание техники", color=disnake.Color.blurple())
@@ -9750,7 +9806,13 @@ class CountryTechCreateView(disnake.ui.View):
             f"> {self.tech_type or 'не выбран'}",
             "",
             "- Цена:",
-            f"> {format_number(self.tech_price) + ' ' + MONEY_EMOJI if self.tech_price is not None else '—'}",
+        ]
+        if not self.cost_items:
+            lines.append("> —")
+        else:
+            for name, qty in self.cost_items:
+                lines.append(f"> {name} — {qty}")
+        lines.extend([
             "",
             "- Описание:",
             f"> {self.description or 'не указано'}",
@@ -9760,11 +9822,11 @@ class CountryTechCreateView(disnake.ui.View):
             "",
             "- Лицензия:",
             f"> {self.license_name}",
-        ]
+        ])
         e.description = "\n".join(lines)
         return e
 
-    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.success)
+    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.success, custom_id="country_tech_confirm")
     async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
         if self.on_submit:
             await self.on_submit(self, inter)
@@ -9776,6 +9838,7 @@ class CountryTechCreateView(disnake.ui.View):
             "tech_type_id": self.tech_type_id,
             "tech_type_name": self.tech_type,
             "tech_price": self.tech_price,
+            "cost_items": self.cost_items,
             "description": self.description,
             "wiki": self.wiki,
             "license": self.license_name,
@@ -10902,6 +10965,30 @@ async def type_tech_cmd(ctx: commands.Context):
     view = TechTypeView(ctx)
     msg = await ctx.send(embed=view.build_embed(), view=view)
     view.message = msg
+
+
+@bot.command(name="type-list")
+async def type_list_cmd(ctx: commands.Context):
+    """Отображает созданные типы техники и их параметры."""
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    types = get_all_tech_types(ctx.guild.id)
+    if not types:
+        return await ctx.send("Типы техники не найдены.")
+    e = disnake.Embed(title="Список типов техники", color=disnake.Color.blurple())
+    _server_icon_and_name(e, ctx.guild, ctx.bot.user)
+    lines = []
+    for t in types:
+        lines.append(f"**{t['id']}. {t['name']}** ({t['branch']})")
+        items = t.get("required_items") or []
+        if items:
+            for name, qty in items:
+                lines.append(f"- {name} — {qty}")
+        else:
+            lines.append("- —")
+        lines.append("")
+    e.description = "\n".join(lines).rstrip()
+    await ctx.send(embed=e)
 
 
 @bot.event
