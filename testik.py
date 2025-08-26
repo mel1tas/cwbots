@@ -126,6 +126,9 @@ TECH_APPLICATION_CHANNEL_ID = 1373273403775127555 # Укажите иденти�
 # ID канала, в который будет отправляться и обновляться список свободных стран
 FREE_COUNTRIES_CHANNEL_ID = 1373273403775127556  # Замените на реальный ID канала
 
+# ID канала, в который будет отправляться и обновляться список занятых стран
+OCCUPIED_COUNTRIES_CHANNEL_ID = 1409763660187828254  # Замените на реальный ID канала
+
 # Список континентов для отображения
 ALL_CONTINENTS = [
     "Европа",
@@ -2024,6 +2027,9 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
     with contextlib.suppress(Exception):
         await member.edit(nick=desired, reason="Регистрация на страну")
 
+    await send_free_countries_update()
+    await send_occupied_countries_update()
+
 @bot.command(name="unreg-country")
 async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
     if not await ensure_allowed_ctx(ctx, ALLOWED_UNREG_COUNTRY):
@@ -2076,8 +2082,8 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
 
 # --- Свободные страны ---
 
-def build_free_countries_messages(guild: disnake.Guild) -> list[str]:
-    """Формирует сообщения о свободных странах по континентам."""
+def build_free_countries_embeds(guild: disnake.Guild) -> list[disnake.Embed]:
+    """Формирует эмбеды о свободных странах по континентам."""
     rows = countries_list_all(guild.id)
     free_by_continent: dict[str, list[dict]] = {c: [] for c in ALL_CONTINENTS}
     for r in rows:
@@ -2088,22 +2094,45 @@ def build_free_countries_messages(guild: disnake.Guild) -> list[str]:
         free_by_continent[cont].append(r)
 
     timestamp = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
-    messages: list[str] = []
+    embeds: list[disnake.Embed] = []
     for continent, countries in free_by_continent.items():
         lines = [
             f"[{(c.get('code') or '').upper()}] | {c.get('flag') or ''} ・ {c.get('name') or ''}"
             for c in countries
         ]
-        if not lines:
-            lines.append("—")
-        msg = (
-            "Свободные страны:\n\n"
-            f"__{continent}__\n"
-            + "\n".join(lines)
-            + f"\n\n*Обновлено: {timestamp} | {guild.name}*"
-        )
-        messages.append(msg)
-    return messages
+        value = "\n".join(lines) if lines else "—"
+        emb = disnake.Embed(title="Свободные страны", color=disnake.Color.green())
+        emb.add_field(name=continent, value=value, inline=False)
+        emb.set_footer(text=f"Обновлено: {timestamp} | {guild.name}")
+        embeds.append(emb)
+    return embeds
+
+
+def build_occupied_countries_embeds(guild: disnake.Guild) -> list[disnake.Embed]:
+    """Формирует эмбеды о занятых странах по континентам."""
+    rows = countries_list_all(guild.id)
+    busy_by_continent: dict[str, list[dict]] = {c: [] for c in ALL_CONTINENTS}
+    for r in rows:
+        uid = r.get("registered_user_id")
+        if not uid:
+            continue
+        cont = r.get("continent") or "Другие"
+        busy_by_continent.setdefault(cont, [])
+        busy_by_continent[cont].append(r)
+
+    timestamp = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+    embeds: list[disnake.Embed] = []
+    for continent, countries in busy_by_continent.items():
+        lines = [
+            f"[{(c.get('code') or '').upper()}] | {c.get('flag') or ''} ・ {c.get('name') or ''} — <@{c.get('registered_user_id')}>"
+            for c in countries
+        ]
+        value = "\n".join(lines) if lines else "—"
+        emb = disnake.Embed(title="Занятые страны", color=disnake.Color.red())
+        emb.add_field(name=continent, value=value, inline=False)
+        emb.set_footer(text=f"Обновлено: {timestamp} | {guild.name}")
+        embeds.append(emb)
+    return embeds
 
 
 @bot.command(name="fc")
@@ -2111,26 +2140,50 @@ async def free_countries_cmd(ctx: commands.Context):
     """Отображает список свободных стран по континентам."""
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    messages = build_free_countries_messages(ctx.guild)
-    for msg in messages:
-        await ctx.send(msg)
+    embeds = build_free_countries_embeds(ctx.guild)
+    for emb in embeds:
+        await ctx.send(embed=emb)
 
 
-@tasks.loop(minutes=10)
-async def update_free_countries():
-    """Периодически обновляет сообщения со свободными странами в указанном канале."""
+@bot.command(name="nfc")
+async def occupied_countries_cmd(ctx: commands.Context):
+    """Отображает список занятых стран по континентам."""
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    embeds = build_occupied_countries_embeds(ctx.guild)
+    for emb in embeds:
+        await ctx.send(embed=emb)
+
+async def send_free_countries_update():
     channel = bot.get_channel(FREE_COUNTRIES_CHANNEL_ID)
     if not channel:
         return
     guild = channel.guild
     with contextlib.suppress(Exception):
         await channel.purge(limit=100, check=lambda m: m.author == bot.user)
-    for msg in build_free_countries_messages(guild):
-        await channel.send(msg)
+    for emb in build_free_countries_embeds(guild):
+        await channel.send(embed=emb)
 
 
-@update_free_countries.before_loop
-async def before_update_free_countries():
+async def send_occupied_countries_update():
+    channel = bot.get_channel(OCCUPIED_COUNTRIES_CHANNEL_ID)
+    if not channel:
+        return
+    guild = channel.guild
+    with contextlib.suppress(Exception):
+        await channel.purge(limit=100, check=lambda m: m.author == bot.user)
+    for emb in build_occupied_countries_embeds(guild):
+        await channel.send(embed=emb)
+
+
+@tasks.loop(minutes=10)
+async def update_country_lists():
+    await send_free_countries_update()
+    await send_occupied_countries_update()
+
+
+@update_country_lists.before_loop
+async def before_update_country_lists():
     await bot.wait_until_ready()
 
 
@@ -8138,8 +8191,8 @@ async def on_ready():
     setup_database()
     print(f'Бот {bot.user} готов к работе!')
     print(f'Подключен к {len(bot.guilds)} серверам.')
-    if not update_free_countries.is_running():
-        update_free_countries.start()
+    if not update_country_lists.is_running():
+        update_country_lists.start()
 
 @bot.command(name="balance", aliases=["bal", "Bal", "Баланс", "Бал", "баланс", "бал", "BAL", "BALANCE", "БАЛАНС", "БАЛ", "Balance"])
 async def balance_prefix(ctx: commands.Context, user: disnake.Member = None):
