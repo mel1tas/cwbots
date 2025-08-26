@@ -3124,7 +3124,7 @@ def _item_row_to_dict(row) -> Optional[dict]:
         "roles_granted_on_buy": parse_roles_field(row[15]),
         "roles_removed_on_buy": parse_roles_field(row[16]),
         "disallow_sell": int(row[17] or 0),
-        "license_role_id": None if row[18] is None else int(row[18]),
+        "license_code": row[18] or None,
     }
 
 ROLE_ID_FINDER = re.compile(r"\d+")
@@ -3387,6 +3387,61 @@ def add_shop_item_simple(guild_id: int, name: str, price: int, description: str 
             None,
             0,
             None,
+        ),
+    )
+    item_id = c.lastrowid
+    try:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO item_shop_state (guild_id, item_id, current_stock, last_restock_ymd)
+            VALUES (?, ?, ?, ?)
+            """,
+            (guild_id, item_id, None, ymd_utc()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def add_shop_item_from_tech(
+    guild_id: int,
+    name: str,
+    price: int,
+    description: str,
+    cost_items: list[dict] | None,
+    license_code: str | None,
+) -> None:
+    """Добавляет предмет техники в магазин с требованиями по ресурсам и лицензии."""
+    buy_type = "items" if cost_items else "currency"
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO items (
+            guild_id, name, name_lower, price, sell_price, description,
+            buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
+            per_user_daily_limit, roles_required_buy, roles_required_sell,
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            guild_id,
+            name,
+            name.lower(),
+            price,
+            None,
+            description,
+            buy_type,
+            json.dumps(cost_items) if cost_items else None,
+            1,
+            None,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+            license_code,
         ),
     )
     item_id = c.lastrowid
@@ -9687,13 +9742,27 @@ class TechApplicationModerationView(disnake.ui.View):
 
     @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
     async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        type_id = self.data.get("tech_type_id")
-        price = 0
-        if type_id:
-            info = get_tech_type_by_id(inter.guild.id, type_id)
-            if info:
-                price = int(info.get("price") or 0)
-        add_shop_item_simple(inter.guild.id, self.data.get("name") or "Предмет", price, self.data.get("description") or "")
+        price = int(self.data.get("tech_price") or 0)
+        cost_items = []
+        for name, qty in self.data.get("cost_items") or []:
+            item = get_item_by_name(inter.guild.id, name)
+            if item:
+                try:
+                    cost_items.append({"item_id": int(item["id"]), "qty": int(qty)})
+                except Exception:
+                    continue
+        flag = self.data.get("flag") or ""
+        type_name = self.data.get("tech_type_name") or ""
+        base_name = self.data.get("name") or "Предмет"
+        item_name = f"{flag}[{type_name}] {base_name}".strip()
+        add_shop_item_from_tech(
+            inter.guild.id,
+            item_name,
+            price,
+            self.data.get("description") or "",
+            cost_items,
+            self.data.get("license_code"),
+        )
         await inter.response.send_message("Заявка принята.", ephemeral=True)
         with contextlib.suppress(Exception):
             await self.applicant.send(f"Ваша техника '{self.data.get('name')}' одобрена.")
@@ -9770,6 +9839,8 @@ class CountryTechCreateView(disnake.ui.View):
 
         code = country_get_registration_for_user(target.guild.id, target.id)
         info = country_get_by_code_or_name(target.guild.id, code) if code else None
+        self.license_code = code
+        self.flag = normalize_flag_emoji(info.get("flag"), code_hint=code) if info else ""
         self.license_name = build_country_license_name(info) if info else "—"
 
         self.add_item(TechCreateSelect(self))
@@ -9842,6 +9913,8 @@ class CountryTechCreateView(disnake.ui.View):
             "description": self.description,
             "wiki": self.wiki,
             "license": self.license_name,
+            "license_code": self.license_code,
+            "flag": self.flag,
         }
         channel = inter.guild.get_channel(TECH_APPLICATION_CHANNEL_ID)
         if channel:
