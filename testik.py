@@ -1,5 +1,5 @@
 import disnake
-from disnake.ext import commands
+from disnake.ext import commands, tasks
 import sqlite3
 import os
 import random
@@ -121,7 +121,21 @@ LICENSE_PERMISSION_LIST = [
 # ID канала для подсчёта сообщений-новостей
 NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
 # ID канала, на который будут отправляться заявки на создание техники 
-TECH_APPLICATION_CHANNEL_ID = 1373273403775127555 # Укажите идентификатор канала для заявок 
+TECH_APPLICATION_CHANNEL_ID = 1373273403775127555 # Укажите идентификатор канала для заявок
+
+# ID канала, в который будет отправляться и обновляться список свободных стран
+FREE_COUNTRIES_CHANNEL_ID = 1373273403775127556  # Замените на реальный ID канала
+
+# Список континентов для отображения
+ALL_CONTINENTS = [
+    "Европа",
+    "Азия",
+    "Африка",
+    "Северная Америка",
+    "Южная Америка",
+    "Океания",
+    "Антарктида",
+]
 
 def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
     """
@@ -2058,6 +2072,66 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
     e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
     await ctx.send(embed=e)
 # ============================================
+
+
+# --- Свободные страны ---
+
+def build_free_countries_messages(guild: disnake.Guild) -> list[str]:
+    """Формирует сообщения о свободных странах по континентам."""
+    rows = countries_list_all(guild.id)
+    free_by_continent: dict[str, list[dict]] = {c: [] for c in ALL_CONTINENTS}
+    for r in rows:
+        if r.get("registered_user_id"):
+            continue
+        cont = r.get("continent") or "Другие"
+        free_by_continent.setdefault(cont, [])
+        free_by_continent[cont].append(r)
+
+    timestamp = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
+    messages: list[str] = []
+    for continent, countries in free_by_continent.items():
+        lines = [
+            f"[{(c.get('code') or '').upper()}] | {c.get('flag') or ''} ・ {c.get('name') or ''}"
+            for c in countries
+        ]
+        if not lines:
+            lines.append("—")
+        msg = (
+            "Свободные страны:\n\n"
+            f"__{continent}__\n"
+            + "\n".join(lines)
+            + f"\n\n*Обновлено: {timestamp} | {guild.name}*"
+        )
+        messages.append(msg)
+    return messages
+
+
+@bot.command(name="fc")
+async def free_countries_cmd(ctx: commands.Context):
+    """Отображает список свободных стран по континентам."""
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    messages = build_free_countries_messages(ctx.guild)
+    for msg in messages:
+        await ctx.send(msg)
+
+
+@tasks.loop(minutes=10)
+async def update_free_countries():
+    """Периодически обновляет сообщения со свободными странами в указанном канале."""
+    channel = bot.get_channel(FREE_COUNTRIES_CHANNEL_ID)
+    if not channel:
+        return
+    guild = channel.guild
+    with contextlib.suppress(Exception):
+        await channel.purge(limit=100, check=lambda m: m.author == bot.user)
+    for msg in build_free_countries_messages(guild):
+        await channel.send(msg)
+
+
+@update_free_countries.before_loop
+async def before_update_free_countries():
+    await bot.wait_until_ready()
 
 
 class CountryProfileSelect(disnake.ui.StringSelect):
@@ -8064,6 +8138,8 @@ async def on_ready():
     setup_database()
     print(f'Бот {bot.user} готов к работе!')
     print(f'Подключен к {len(bot.guilds)} серверам.')
+    if not update_free_countries.is_running():
+        update_free_countries.start()
 
 @bot.command(name="balance", aliases=["bal", "Bal", "Баланс", "Бал", "баланс", "бал", "BAL", "BALANCE", "БАЛАНС", "БАЛ", "Balance"])
 async def balance_prefix(ctx: commands.Context, user: disnake.Member = None):
