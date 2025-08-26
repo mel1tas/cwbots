@@ -2044,6 +2044,9 @@ async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
         e.set_footer(text=f"Код страны: {code}")
     await ctx.send(embed=e)
     
+    await send_free_countries_update()
+    await send_occupied_countries_update()
+    
 @bot.command(name="country-user")
 async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
     if not ctx.guild:
@@ -2159,10 +2162,23 @@ async def send_free_countries_update():
     if not channel:
         return
     guild = channel.guild
-    with contextlib.suppress(Exception):
-        await channel.purge(limit=100, check=lambda m: m.author == bot.user)
-    for emb in build_free_countries_embeds(guild):
-        await channel.send(embed=emb)
+    embeds = build_free_countries_embeds(guild)
+    # Получаем существующие сообщения бота
+    existing = [m async for m in channel.history(limit=50) if m.author == bot.user]
+    existing.reverse()  # от старых к новым
+
+    # Обновляем или отправляем новые сообщения
+    for i, emb in enumerate(embeds):
+        if i < len(existing):
+            with contextlib.suppress(Exception):
+                await existing[i].edit(embed=emb)
+        else:
+            await channel.send(embed=emb)
+
+    # Удаляем лишние сообщения
+    for m in existing[len(embeds):]:
+        with contextlib.suppress(Exception):
+            await m.delete()
 
 
 async def send_occupied_countries_update():
@@ -2170,10 +2186,20 @@ async def send_occupied_countries_update():
     if not channel:
         return
     guild = channel.guild
-    with contextlib.suppress(Exception):
-        await channel.purge(limit=100, check=lambda m: m.author == bot.user)
-    for emb in build_occupied_countries_embeds(guild):
-        await channel.send(embed=emb)
+    embeds = build_occupied_countries_embeds(guild)
+    existing = [m async for m in channel.history(limit=50) if m.author == bot.user]
+    existing.reverse()
+
+    for i, emb in enumerate(embeds):
+        if i < len(existing):
+            with contextlib.suppress(Exception):
+                await existing[i].edit(embed=emb)
+        else:
+            await channel.send(embed=emb)
+
+    for m in existing[len(embeds):]:
+        with contextlib.suppress(Exception):
+            await m.delete()
 
 
 @tasks.loop(minutes=10)
